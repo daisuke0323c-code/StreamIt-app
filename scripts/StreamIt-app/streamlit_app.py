@@ -25,6 +25,14 @@ import streamlit as st
 from gitapi.api import GitApiClient
 from openai import OpenAI
 
+# Drag&Drop（あれば使う、無ければフォールバック）
+try:
+    from streamlit_sortables import sortables as _st_sortables
+    _SORTABLES_AVAILABLE = True
+except Exception:
+    _st_sortables = None
+    _SORTABLES_AVAILABLE = False
+
 # =========================
 # Util / JSON helper
 # =========================
@@ -327,6 +335,102 @@ class Agent:
 def new_agent(name: str = "Agent") -> Agent:
     return Agent(id=str(uuid.uuid4())[:8], name=name)
 
+
+def move_agent_within_row(r: int, c: int, delta: int):
+    """同一行内で c を左右に移動。"""
+    grid = st.session_state.grid
+    if r < 0 or r >= len(grid):
+        return
+    row = grid[r]
+    if c < 0 or c >= len(row):
+        return
+    new_c = max(0, min(len(row)-1, c + delta))
+    if new_c == c:
+        return
+    ag = row.pop(c)
+    row.insert(new_c, ag)
+    safe_rerun()
+
+
+def move_agent_to_row(r: int, c: int, delta_row: int):
+    """上下（別行）に移動。移動先の同一列位置に挿入（無ければ末尾）。"""
+    grid = st.session_state.grid
+    if r < 0 or r >= len(grid):
+        return
+    row = grid[r]
+    if c < 0 or c >= len(row):
+        return
+    new_r = r + delta_row
+    if new_r < 0 or new_r >= len(grid):
+        return
+    ag = row.pop(c)
+    dest = grid[new_r]
+    insert_pos = min(c, len(dest))
+    dest.insert(insert_pos, ag)
+    safe_rerun()
+
+
+def move_agent_to(r_src: int, c_src: int, r_dst: int, c_dst: Optional[int] = None):
+    """任意の行/列へ移動（DnD用）。"""
+    grid = st.session_state.grid
+    if r_src < 0 or r_src >= len(grid):
+        return
+    row = grid[r_src]
+    if c_src < 0 or c_src >= len(row):
+        return
+    ag = row.pop(c_src)
+    dest = grid[r_dst]
+    if c_dst is None:
+        dest.append(ag)
+    else:
+        c_dst = max(0, min(len(dest), c_dst))
+        dest.insert(c_dst, ag)
+
+
+def _render_grid_sortable():
+    """Render the grid using streamlit-sortables when available.
+    This will render each row as a sortable container and update st.session_state.grid
+    according to the returned order. Fall back to no-op if the component isn't available.
+    """
+    try:
+        from streamlit_sortables import sortables
+    except Exception:
+        st.warning("streamlit-sortables が利用できません。並べ替えモードをオフにしてください。")
+        return
+
+    grid = st.session_state.grid
+    new_grid = []
+    changed = False
+    for r, row in enumerate(grid):
+        # Prepare labels for items in this row
+        items = [f"{r}:{c}:{ag.id}" for c, ag in enumerate(row)]
+        key = f"sortable_row_{r}"
+        try:
+            order = sortables.sortable(items=items, key=key)
+        except Exception:
+            # If the component returns a mapping or other shape, try to handle common cases
+            try:
+                order = sortables.sortable(items=items, key=key)
+            except Exception:
+                order = items
+        # order is list of item ids in new order
+        id_to_agent = {f"{r}:{c}:{ag.id}": ag for c, ag in enumerate(row)}
+        new_row = []
+        for item in order:
+            ag = id_to_agent.get(item)
+            if ag:
+                new_row.append(ag)
+        # if lengths mismatch, preserve original
+        if len(new_row) != len(row):
+            new_row = row
+        if new_row != row:
+            changed = True
+        new_grid.append(new_row)
+
+    if changed:
+        st.session_state.grid = new_grid
+        safe_rerun()
+
 def ensure_state():
     if "OPENAI_API_KEY" not in st.session_state:
         # Try to load API key from api.key file located next to this script or in the current working directory.
@@ -359,6 +463,12 @@ def ensure_state():
         st.session_state.history_loops = []
     if "global_kv" not in st.session_state:
         st.session_state.global_kv = {}
+    # optional: try to import streamlit-sortables once and set availability flag
+    if "_SORTABLES_AVAILABLE" not in st.session_state:
+        try:
+            st.session_state._SORTABLES_AVAILABLE = True
+        except Exception:
+            st.session_state._SORTABLES_AVAILABLE = False
     if "defaults" not in st.session_state:
         st.session_state.defaults = {
             "model": "gpt-4o-mini",
@@ -376,6 +486,8 @@ def ensure_state():
         st.session_state.view = "main"  # "main" | "detail"
         # initialize doc-related KV if missing
         init_doc_kv_if_missing()
+    if "reorder_mode" not in st.session_state:
+        st.session_state.reorder_mode = False  # True の時はDnD UIを表示
 
 
 # ---------- response builder (for easy path access) ----------
@@ -1702,6 +1814,14 @@ with st.sidebar:
         st.success("DAG分岐サンプルを配置しました")
 
     st.markdown("---")
+    st.subheader("並べ替え")
+    st.session_state.reorder_mode = st.checkbox(
+        "ドラッグ＆ドロップで並べ替え（streamlit-sortables）",
+        value=st.session_state.get("reorder_mode", False),
+        help="インストール済みなら DnD で行/列の再配置が可能。未インストール時はタイル上の矢印ボタンで移動してください。"
+    )
+
+    st.markdown("---")
     st.subheader("設定の保存 / 読み込み")
 
     SAVE_DIR = os.path.join(os.path.expanduser("~"), ".streamlit_app_saves")
@@ -2035,6 +2155,13 @@ def render_main():
     base_cols = int(st.session_state.defaults["columns_per_row"])
 
     # 行（Step）ごとに描画
+    # If reorder mode is enabled and streamlit-sortables is available, render sortable grid
+    if st.session_state.get("reorder_mode") and (
+        st.session_state.get("_SORTABLES_AVAILABLE") or globals().get("_SORTABLES_AVAILABLE")
+    ):
+        _render_grid_sortable()
+        return
+
     for r, row in enumerate(st.session_state.grid):
         # 行ヘッダ（見出し＋行/並列追加）
         # Show role badges above the step to indicate purpose (Collector/Normalizer/...)
@@ -2152,16 +2279,22 @@ def render_main():
                                 st.error(f"エラー: {e}")
                         st.caption("Run")
                     with ctrl_cols[4]:
+                        # movement fallback buttons (visible when DnD unavailable)
+                        if st.button("←", key=f"move_left_{agent.id}"):
+                            move_agent_within_row(r, c, -1)
+                        if st.button("→", key=f"move_right_{agent.id}"):
+                            move_agent_within_row(r, c, 1)
+                        if st.button("↑", key=f"move_up_{agent.id}"):
+                            move_agent_to_row(r, c, -1)
+                        if st.button("↓", key=f"move_down_{agent.id}"):
+                            move_agent_to_row(r, c, 1)
+                        st.caption("Move")
+                    with ctrl_cols[5]:
                         if st.button("■", key=f"clear_{agent.id}"):
                             agent.last_raw = ""
                             agent.last_json = None
                             st.session_state.grid[r][c] = agent
                         st.caption("Clear")
-                    with ctrl_cols[5]:
-                        # placeholder for additional actions
-                        if st.button("⋯", key=f"more_{agent.id}"):
-                            st.info("追加アクション")
-                        st.caption("")
 
                     # (removed outer tile-area wrapper)
                 else:
