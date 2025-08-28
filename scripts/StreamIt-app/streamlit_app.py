@@ -1,13 +1,25 @@
 # -*- coding: utf-8 -*-
 
+import hashlib
+import html
 import json
 import os
 import re
+import threading
+import time
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
+from queue import Queue
 from typing import Any, Dict, List, Optional
+
+
+def _normalize_newlines(text: str) -> str:
+    """Windows/Unix 混在でも GitHub 上で崩れないように LF に正規化。"""
+    if not isinstance(text, str):
+        return str(text)
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 import streamlit as st
 from gitapi.api import GitApiClient
@@ -27,9 +39,48 @@ def safe_rerun():
         pass
 
 def get_openai_client() -> OpenAI:
+    # Prefer explicit OPENAI_API_KEY (env or session). Fall back to LLM_API_KEY env or secrets.toml.
     api_key = os.environ.get("OPENAI_API_KEY") or st.session_state.get("OPENAI_API_KEY")
     if not api_key:
+        # check alternative env var
+        api_key = os.environ.get("LLM_API_KEY")
+    if not api_key:
+        # try reading local secrets.toml for LLM_API_KEY without failing loudly
+        try:
+            try:
+                import tomllib as toml_loader  # type: ignore
+            except Exception:
+                try:
+                    import toml as toml_loader  # type: ignore
+                except Exception:
+                    toml_loader = None
+            if toml_loader is not None:
+                s_path = os.path.join(os.path.dirname(__file__), "secrets.toml")
+                if os.path.exists(s_path):
+                    with open(s_path, "r", encoding="utf-8") as fh:
+                        text = fh.read()
+                    try:
+                        data = toml_loader.loads(text)
+                    except Exception:
+                        try:
+                            import toml as _toml
+                            data = _toml.loads(text)
+                        except Exception:
+                            data = {}
+                    api_key = data.get("LLM_API_KEY") or data.get("OPENAI_API_KEY") or api_key
+        except Exception:
+            api_key = api_key
+
+    if api_key:
+        # persist into session so sidebar shows it and subsequent calls reuse it
+        try:
+            st.session_state.OPENAI_API_KEY = api_key
+        except Exception:
+            pass
+
+    if not api_key:
         raise RuntimeError("OPENAI_API_KEY が未設定です。サイドバーで入力してください。")
+
     return OpenAI(api_key=api_key)
 
 def json_pretty(obj: Any) -> str:
@@ -84,27 +135,68 @@ def extract_first_json(text: str) -> Optional[Any]:
     return None
 
 def force_parse_json(text: str) -> Optional[Any]:
-    j = extract_codeblock_json(text)
-    if j is not None:
-        return j
+    # Try to find JSON blocks in code fences first
+    results: List[Any] = []
     if "```" in text:
         parts = text.split("```")
         for i in range(1, len(parts), 2):
             body = parts[i]
             try:
-                return json.loads(body)
+                results.append(json.loads(body))
             except Exception:
                 continue
-    j = extract_first_json(text)
-    if j is not None:
-        return j
-    m = re.search(r"JSON\s*:\s*(\{.*|\[.*)", text, flags=re.S)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except Exception:
-            pass
-    return None
+
+    # Then try to extract all inline JSON objects/arrays
+    def extract_all_jsons(s: str) -> List[Any]:
+        out: List[Any] = []
+        start_idx = None
+        stack: List[str] = []
+        for i, ch in enumerate(s):
+            if ch in "{[":
+                if not stack:
+                    start_idx = i
+                stack.append(ch)
+            elif ch in "}]":
+                if not stack:
+                    continue
+                open_ch = stack.pop()
+                if (open_ch == "{" and ch != "}") or (open_ch == "[" and ch != "]"):
+                    stack = []
+                    start_idx = None
+                    continue
+                if not stack and start_idx is not None:
+                    candidate = s[start_idx:i+1]
+                    try:
+                        out.append(json.loads(candidate))
+                    except Exception:
+                        pass
+                    start_idx = None
+        return out
+
+    try:
+        inline = extract_all_jsons(text)
+        results.extend(inline)
+    except Exception:
+        pass
+
+    # If no JSON found via fences or inline heuristics, try the old heuristic
+    if not results:
+        m = re.search(r"JSON\s*:\s*(\{.*|\[.*)", text, flags=re.S)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except Exception:
+                pass
+        return None
+
+    # Prefer JSON objects that look like agent outputs (contain ok/message/kv_patch)
+    for candidate in results:
+        if isinstance(candidate, dict):
+            if any(k in candidate for k in ("ok", "message", "kv_patch", "__kv_patch__")):
+                return candidate
+
+    # Otherwise prefer the last parsed JSON block (often the fuller final output)
+    return results[-1]
 
 def call_llm(messages: List[Dict[str, str]], model: str, temperature: float, max_tokens: int, seed: Optional[int]) -> str:
     client = get_openai_client()
@@ -113,6 +205,95 @@ def call_llm(messages: List[Dict[str, str]], model: str, temperature: float, max
         kwargs["seed"] = seed
     resp = client.chat.completions.create(messages=messages, **kwargs)
     return resp.choices[0].message.content
+
+
+def run_with_timeout(func, args=(), kwargs=None, timeout: int = 30):
+    """Run func(*args, **kwargs) in a thread and return (ok, result_or_exception).
+
+    If timeout elapses, return (False, TimeoutError).
+    """
+    if kwargs is None:
+        kwargs = {}
+    q: Queue = Queue()
+
+    def _target():
+        try:
+            res = func(*args, **kwargs)
+            q.put((True, res))
+        except Exception as e:
+            q.put((False, e))
+
+    th = threading.Thread(target=_target, daemon=True)
+    th.start()
+    try:
+        ok, val = q.get(timeout=timeout)
+        return ok, val
+    except Exception:
+        return False, TimeoutError(f"timeout after {timeout}s")
+
+
+def validate_json_schema(obj: Any, schema: Optional[Dict[str, Any]]) -> bool:
+    """Validate obj against schema if jsonschema is available; otherwise do basic key checks.
+
+    Returns True if valid or no schema provided; False if invalid.
+    """
+    if not schema:
+        return True
+    try:
+        import jsonschema
+        jsonschema.validate(instance=obj, schema=schema)
+        return True
+    except Exception:
+        # fallback: do a minimal required-fields check if schema specifies 'required'
+        try:
+            req = schema.get("required")
+            if req and isinstance(obj, dict):
+                for k in req:
+                    if k not in obj:
+                        return False
+                return True
+        except Exception:
+            pass
+        return False
+
+
+def call_llm_with_retries(messages: List[Dict[str, str]], model: str, temperature: float, max_tokens: int, seed: Optional[int],
+                          retries: int = 2,
+                          backoff: float = 2.0,
+                          timeout: int = 30,
+                          schema: Optional[Dict[str, Any]] = None,
+                          ) -> str:
+    """Call call_llm with retries, exponential backoff, timeout, and optional schema validation.
+
+    Raises Exception on unrecoverable failure.
+    """
+    attempt = 0
+    wait = 1.0
+    last_err = None
+    while attempt <= retries:
+        attempt += 1
+        ok, res = run_with_timeout(
+            call_llm,
+            args=(messages, model, temperature, max_tokens, seed),
+            timeout=timeout,
+        )
+        if ok:
+            # ensure we have a string before parsing
+            raw = res if isinstance(res, str) else str(res)
+            parsed = force_parse_json(raw)
+            valid = validate_json_schema(
+                parsed if parsed is not None else raw,
+                schema,
+            )
+            if valid:
+                return raw
+            last_err = Exception("schema validation failed")
+        else:
+            last_err = res
+        if attempt <= retries:
+            time.sleep(wait)
+            wait *= backoff
+    raise last_err or Exception("LLM call failed")
 
 
 # =========================
@@ -132,6 +313,13 @@ class Agent:
     history: List[Dict[str, str]] = field(default_factory=list)
     last_raw: str = ""
     last_json: Any = None
+    # DAG execution controls
+    retries: int = 2
+    backoff: float = 2.0
+    timeout: int = 30
+    expected_schema: Optional[Dict[str, Any]] = None
+    # prompt versioning history (list of {ts,hash,model})
+    prompt_versions: List[Dict[str, Any]] = field(default_factory=list)
 
 def new_agent(name: str = "Agent") -> Agent:
     return Agent(id=str(uuid.uuid4())[:8], name=name)
@@ -389,8 +577,9 @@ def write_repo_file(path_in_repo: str, content: str) -> tuple[bool, Optional[str
         # local write fallback
         d = os.path.dirname(p)
         os.makedirs(d, exist_ok=True)
-        with open(p, 'w', encoding='utf-8') as fh:
-            fh.write(content)
+        # normalize newlines to LF when writing locally
+        with open(p, 'w', encoding='utf-8', newline='\n') as fh:
+            fh.write(_normalize_newlines(content))
         info = p
         if 'fallback_err' in locals() and fallback_err:
             info = f"local write succeeded, remote push failed: {fallback_err}"
@@ -737,10 +926,35 @@ def run_agent(agent: Agent, row_idx: int) -> Agent:
     max_tokens = int(agent.max_tokens or st.session_state.defaults["max_tokens"])
     seed = agent.seed if agent.seed is not None else st.session_state.defaults["seed"]
 
+    # record prompt version metadata
     try:
-        raw = call_llm(messages, model=model, temperature=temperature, max_tokens=max_tokens, seed=seed)
+        pv = {
+            "ts": time.time(),
+            "hash": hashlib.sha256(json.dumps(messages, ensure_ascii=False).encode("utf-8")).hexdigest()[:10],
+            "model": model,
+        }
+        agent.prompt_versions.append(pv)
+    except Exception:
+        pass
+
+    try:
+        raw = call_llm_with_retries(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            seed=seed,
+            retries=agent.retries,
+            backoff=agent.backoff,
+            timeout=agent.timeout,
+            schema=agent.expected_schema,
+        )
     except Exception as e:
-        raw = f'{{"ok":false,"message":{{"error":"LLM呼び出しエラー: {e}"}}, "kv_patch":{{}}, "meta":{{}}}}'
+        raw = (
+            '{"ok":false,"message":{"error":"LLM呼び出しエラー: '
+            + str(e)
+            + '"}, "kv_patch":{}, "meta":{}}'
+        )
 
     parsed = force_parse_json(raw)
     unified = normalize_unified(parsed)
@@ -773,7 +987,43 @@ def step_execute(row_idx: int):
         if isinstance(updated.last_json, dict):
             patch = updated.last_json.get("kv_patch") or updated.last_json.get("__kv_patch__")
             if isinstance(patch, dict):
+                # apply to global_kv
                 st.session_state.global_kv.update(patch)
+
+                # Determine if we should auto-write to repo: explicit flag or presence of target_doc
+                auto_write = bool(patch.get("__write_to_repo__", False)) or ("target_doc" in patch)
+
+                if auto_write:
+                    # determine repo path
+                    if "__repo_path__" in patch and patch.get("__repo_path__"):
+                        repo_path = patch.get("__repo_path__")
+                    else:
+                        cfg = load_github_config()
+                        repo_path = cfg.get("file_path")
+
+                    try:
+                        # prefer explicit __content__ if provided
+                        if "__content__" in patch and isinstance(patch.get("__content__"), str):
+                            content = patch.get("__content__")
+                        # if target_doc exists and repo_path is markdown, write it verbatim
+                        elif "target_doc" in patch and isinstance(patch.get("target_doc"), str) and str(repo_path).lower().endswith(".md"):
+                            content = patch.get("target_doc")
+                        else:
+                            # fallback: dump global_kv as JSON
+                            content = json_pretty(st.session_state.global_kv)
+
+                        # normalize newlines and write
+                        content = _normalize_newlines(content)
+                        ok, info = write_repo_file(repo_path, content)
+                    except Exception as e:
+                        ok, info = False, str(e)
+
+                    st.session_state.last_repo_write = {
+                        "ok": bool(ok),
+                        "info": info,
+                        "repo_path": repo_path,
+                        "agent": updated.id,
+                    }
 
     if len(st.session_state.current_loop_steps) == row_idx:
         st.session_state.current_loop_steps.append(step_result)
@@ -805,6 +1055,23 @@ def run_one_step():
     row_idx = st.session_state.current_row
     step_execute(row_idx)
     complete_loop_if_needed(row_idx)
+
+
+def run_row(row_idx: int):
+    """Run all agents in a specific row sequentially and store results."""
+    if row_idx >= len(st.session_state.grid):
+        return
+    row = st.session_state.grid[row_idx]
+    for col, agent in enumerate(row):
+        if not agent.enabled:
+            continue
+        try:
+            updated = run_agent(agent, row_idx)
+            st.session_state.grid[row_idx][col] = updated
+        except Exception as e:
+            # record error in agent.last_raw for visibility
+            agent.last_raw = f"Error: {e}"
+            st.session_state.grid[row_idx][col] = agent
 
 def run_to_end():
     if not st.session_state.grid or not st.session_state.grid[0]:
@@ -1126,6 +1393,23 @@ st.markdown("""
     .stColumn[data-testid="stColumn"] .result-preview {
         margin: 6px 0 !important;
     }
+    /* Role badge */
+    .role-badge {
+        display: inline-block;
+        padding: 3px 8px;
+        margin-right: 6px;
+        margin-bottom: 6px;
+        border-radius: 999px;
+        font-size: 0.78rem;
+        color: #fff;
+        vertical-align: middle;
+    }
+    .role-collector { background: #2563eb; }
+    .role-normalizer { background: #7c3aed; }
+    .role-linter { background: #f59e0b; }
+    .role-judge { background: #10b981; }
+    .role-editor { background: #0ea5a4; }
+    .role-default { background: #6b7280; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1194,6 +1478,13 @@ with st.sidebar:
     st.write(f"Loop: {st.session_state.loop_index}")
     st.write(f"Current Row: {st.session_state.current_row+1} / {len(st.session_state.grid)}")
     st.write(f"Agents Total: {sum(len(r) for r in st.session_state.grid)}")
+    # progress bar for current loop progress
+    try:
+        total_steps = max(1, len(st.session_state.grid))
+        progress_val = float(st.session_state.current_row) / float(total_steps)
+        st.progress(progress_val)
+    except Exception:
+        pass
 
     # 操作
     st.markdown("---")
@@ -1549,6 +1840,23 @@ def render_main():
     # 行（Step）ごとに描画
     for r, row in enumerate(st.session_state.grid):
         # 行ヘッダ（見出し＋行/並列追加）
+        # Show role badges above the step to indicate purpose (Collector/Normalizer/...)
+        try:
+            roles = []
+            for ag in row:
+                nm = (ag.name or "").strip()
+                if nm:
+                    roles.append(nm.split()[0])
+            if roles:
+                badges_html = ""
+                import html as _html
+                for role in roles:
+                    cls = re.sub(r'[^a-z0-9]', '-', role.lower())
+                    cls = cls if cls else 'default'
+                    badges_html += f'<span class="role-badge role-{cls}">{_html.escape(role)}</span>'
+                st.markdown(badges_html, unsafe_allow_html=True)
+        except Exception:
+            pass
         # Use native Streamlit header to avoid injecting an extra small wrapper div
         st.subheader(f"Step {r+1}")
         h1, h2 = st.columns([6,2])
@@ -1576,91 +1884,87 @@ def render_main():
                 cell_cls = "agent-cell" + (" has-agent" if has_agent else " empty")
                 if has_agent:
                     agent = row[c]
-                    # まず結果テキストを整形
-                    result_content = ""
-                    if agent.last_json and isinstance(agent.last_json, dict):
-                        message = agent.last_json.get("message", {})
-                        if message:
-                            result_content = json_pretty(message)
-                            if len(result_content) > 400:
-                                result_content = result_content[:400] + "..."
-                        else:
-                            result_content = "(no message)"
-                    elif agent.last_raw:
-                        result_content = agent.last_raw[:400] + "..." if len(agent.last_raw) > 400 else agent.last_raw
-                    else:
-                        result_content = "(no result)"
-
-                    import html
-                    escaped_content = html.escape(result_content)
-
-                    # result を Streamlit の code/text ブロックで表示（これにより必ずこのセル内に描画される）
-                    # build result-preview block; add 'selected' class when this agent is targeted
-                    is_selected = (st.session_state.get("ui_target_agent_id") == agent.id)
-                    sel_cls = " selected" if is_selected else ""
-                    # Combine result and a narrow spacer so result preview gets most width
+                    # header area: show enable toggle near the top for visibility
                     left_col, _spacer = cell_container.columns([4,1], gap="small")
-                    # left: result preview
                     with left_col:
-                        if agent.last_json and isinstance(agent.last_json, dict):
-                            msg = agent.last_json.get("message")
-                            if msg:
-                                import html as _html
-                                left_col.markdown(f'<div class="result-preview{sel_cls}"><pre>{_html.escape(json_pretty(msg))}</pre></div>', unsafe_allow_html=True)
-                            else:
-                                left_col.markdown(f'<div class="result-preview no-result{sel_cls}">(no message)</div>', unsafe_allow_html=True)
-                        elif agent.last_raw:
-                            import html as _html
-                            left_col.markdown(f'<div class="result-preview{sel_cls}"><pre>{_html.escape(agent.last_raw)}</pre></div>', unsafe_allow_html=True)
-                        else:
-                            left_col.markdown(f'<div class="result-preview no-result{sel_cls}">(no result)</div>', unsafe_allow_html=True)
-                    # controllers: render a single horizontal row under the result preview inside left_col
-                    with left_col:
-                        ctrl_cols = left_col.columns([1,1,1,1,1,1], gap="small")
-                        with ctrl_cols[0]:
-                            if st.button("+", key=f"plus_{agent.id}"):
-                                st.session_state.grid[r].insert(
-                                    c+1, new_agent(f"Agent {len(st.session_state.grid[r])+1}"))
-                                safe_rerun()
-                        with ctrl_cols[1]:
-                            if st.button("-", key=f"minus_{agent.id}"):
-                                try:
-                                    st.session_state.grid[r].pop(c)
-                                except Exception:
-                                    pass
-                                safe_rerun()
-                        with ctrl_cols[2]:
-                            if st.button("🔍", key=f"tile_detail_{agent.id}"):
-                                go_detail(agent.id)
-                        with ctrl_cols[3]:
-                            toggled = st.checkbox(
-                                "\u00A0",
-                                value=agent.enabled,
-                                key=f"en_{agent.id}",
-                                label_visibility="collapsed",
-                            )
-                        with ctrl_cols[4]:
-                            if st.button("▶", key=f"run_{agent.id}"):
-                                try:
-                                    updated = run_agent(agent, r)
-                                    st.session_state.grid[r][c] = updated
-                                    st.success("実行完了")
-                                except Exception as e:
-                                    st.error(f"エラー: {e}")
-                        with ctrl_cols[5]:
-                            if st.button("■", key=f"clear_{agent.id}"):
-                                agent.last_raw = ""
-                                agent.last_json = None
+                        hd_cols = left_col.columns([4,1], gap="small")
+                        with hd_cols[0]:
+                            # small title (agent name)
+                            left_col.markdown(f"**{agent.name}**")
+                        with hd_cols[1]:
+                            toggled = hd_cols[1].checkbox("Enable", value=agent.enabled, key=f"en_hd_{agent.id}", label_visibility="collapsed")
+                            if toggled != agent.enabled:
+                                agent.enabled = toggled
                                 st.session_state.grid[r][c] = agent
 
-                        # small label for enable under the buttons area
-                        left_col.markdown(
-                            '<div style="font-size:0.78rem;margin-top:4px;">Enable</div>',
-                            unsafe_allow_html=True,
-                        )
-                        if toggled != agent.enabled:
-                            agent.enabled = toggled
+                    # result preview: tabs inside an expander for compactness
+                    result_container = left_col.expander("Result Preview", expanded=False)
+                    with result_container:
+                        tabs = result_container.tabs(["Parsed", "Raw"])
+                        # Parsed (JSON) tab
+                        with tabs[0]:
+                            if agent.last_json and isinstance(agent.last_json, dict):
+                                msg = agent.last_json.get("message")
+                                if msg:
+                                    result_text = json_pretty(msg)
+                                    try:
+                                        import html as _html
+                                        result_container.code(result_text, language="json")
+                                    except Exception:
+                                        result_container.text(result_text)
+                                else:
+                                    result_container.info("(no message)")
+                            else:
+                                result_container.info("(no parsed JSON)")
+                        # Raw tab
+                        with tabs[1]:
+                            if agent.last_raw:
+                                try:
+                                    result_container.code(agent.last_raw, language="")
+                                except Exception:
+                                    result_container.text(agent.last_raw)
+                            else:
+                                result_container.info("(no raw output)")
+
+                    # controllers: compact icon-like buttons with small captions
+                    ctrl_cols = cell_container.columns([1,1,1,1,1,1], gap="small")
+                    with ctrl_cols[0]:
+                        if st.button("+", key=f"plus_{agent.id}"):
+                            st.session_state.grid[r].insert(c+1, new_agent(f"Agent {len(st.session_state.grid[r])+1}"))
+                            safe_rerun()
+                        st.caption("Add")
+                    with ctrl_cols[1]:
+                        if st.button("-", key=f"minus_{agent.id}"):
+                            try:
+                                st.session_state.grid[r].pop(c)
+                            except Exception:
+                                pass
+                            safe_rerun()
+                        st.caption("Remove")
+                    with ctrl_cols[2]:
+                        if st.button("🔍", key=f"tile_detail_{agent.id}"):
+                            go_detail(agent.id)
+                        st.caption("Detail")
+                    with ctrl_cols[3]:
+                        if st.button("▶", key=f"run_{agent.id}"):
+                            try:
+                                updated = run_agent(agent, r)
+                                st.session_state.grid[r][c] = updated
+                                st.success("実行完了")
+                            except Exception as e:
+                                st.error(f"エラー: {e}")
+                        st.caption("Run")
+                    with ctrl_cols[4]:
+                        if st.button("■", key=f"clear_{agent.id}"):
+                            agent.last_raw = ""
+                            agent.last_json = None
                             st.session_state.grid[r][c] = agent
+                        st.caption("Clear")
+                    with ctrl_cols[5]:
+                        # placeholder for additional actions
+                        if st.button("⋯", key=f"more_{agent.id}"):
+                            st.info("追加アクション")
+                        st.caption("")
 
                     # (removed outer tile-area wrapper)
                 else:
