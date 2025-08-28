@@ -320,6 +320,9 @@ class Agent:
     expected_schema: Optional[Dict[str, Any]] = None
     # prompt versioning history (list of {ts,hash,model})
     prompt_versions: List[Dict[str, Any]] = field(default_factory=list)
+    # NEW: routing rules per agent (evaluated if meta.next is not provided by the model)
+    # See docs: list of {name, when, expr, to}
+    routes: List[Dict[str, Any]] = field(default_factory=list)
 
 def new_agent(name: str = "Agent") -> Agent:
     return Agent(id=str(uuid.uuid4())[:8], name=name)
@@ -725,6 +728,64 @@ def load_sample_doc_workflow():
     safe_rerun()
 
 
+def load_sample_dag_branching():
+    """ヘルスチェック → (メイン or フォールバック) → 最終化 の分岐サンプルを配置。"""
+    p_health = (
+        "あなたはヘルスチェックAgentです。Context.global_kv.health を見て healthy かどうかを判断し、"
+        "unified JSON を返します。"
+        "- ok: health=='good' のとき true、それ以外は false\n"
+        "- message: {\"type\":\"health\",\"healthy\":bool}\n"
+        "- meta.next: healthy のとき row='+1'、不健康のとき row='+2'（フォールバックへ）\n"
+    )
+    p_main = (
+        "あなたはメイン処理Agentです。短い処理結果を message に返し、target_doc を軽く追記して kv_patch.target_doc に置いてください。"
+        "meta.next は '+2'（最終化行へ）を指定してください。"
+    )
+    p_fallback = (
+        "あなたはフォールバック処理Agentです。暫定対応案を message に返し、"
+        "meta.next は '+1'（最終化行へ）を指定してください。"
+        "まれに負荷で応答が遅くなる体裁をとりますが、30秒以内にJSONを必ず返してください。"
+    )
+    p_finalize = (
+        "あなたは最終化Agentです。直前の行の出力を参照し、message.summary を作ってください。"
+        "必要なら kv_patch.run_last = true を入れてください。"
+    )
+
+    st.session_state.grid = [
+        [new_agent("HealthCheck")],   # row 0
+        [new_agent("MainPath")],      # row 1
+        [new_agent("FallbackPath")],  # row 2
+        [new_agent("Finalize")]       # row 3
+    ]
+    g = st.session_state.grid
+    g[0][0].user_prompt = p_health
+    g[1][0].user_prompt = p_main
+    g[2][0].user_prompt = p_fallback
+    g[3][0].user_prompt = p_finalize
+
+    g[0][0].timeout = 20
+    g[1][0].timeout = 30
+    g[2][0].timeout = 20
+    g[2][0].retries = 2
+    g[2][0].backoff = 2.0
+    g[3][0].timeout = 30
+
+    g[0][0].routes = [
+        {"name": "ok->main", "when": "success", "to": {"row": "+1"}},
+        {"name": "err->fallback", "when": "error", "to": {"row": "+2"}},
+        {"name": "timeout->fallback", "when": "timeout", "to": {"row": "+2"}}
+    ]
+    g[1][0].routes = [{"name": "main->finalize", "when": "always", "to": {"row": "+2"}}]
+    g[2][0].routes = [{"name": "fallback->finalize", "when": "always", "to": {"row": "+1"}}]
+
+    st.session_state.global_kv.setdefault("target_doc", "# サンプル: DAG分岐\n\n(ここに追記されます)\n")
+    st.session_state.global_kv.setdefault("health", "bad")
+
+    st.session_state.current_row = 0
+    st.session_state.loaded_sample = True
+    safe_rerun()
+
+
 # --- GitHub config loader (centralized) ---
 def load_github_config() -> Dict[str, Optional[str]]:
     """Load GitHub related config with precedence: env -> secrets.toml -> session global_kv -> defaults.
@@ -937,6 +998,7 @@ def run_agent(agent: Agent, row_idx: int) -> Agent:
     except Exception:
         pass
 
+    error_obj: Optional[Exception] = None
     try:
         raw = call_llm_with_retries(
             messages,
@@ -950,6 +1012,7 @@ def run_agent(agent: Agent, row_idx: int) -> Agent:
             schema=agent.expected_schema,
         )
     except Exception as e:
+        error_obj = e
         raw = (
             '{"ok":false,"message":{"error":"LLM呼び出しエラー: '
             + str(e)
@@ -959,6 +1022,25 @@ def run_agent(agent: Agent, row_idx: int) -> Agent:
     parsed = force_parse_json(raw)
     unified = normalize_unified(parsed)
 
+    # NEW: auto-set meta.event based on ok/timeout/error
+    try:
+        parsed_for_event = normalize_unified(parsed)
+        evt = "success" if bool(parsed_for_event.get("ok")) else "error"
+        err_txt = ""
+        if isinstance(parsed_for_event.get("message"), dict):
+            err_txt = str(parsed_for_event["message"].get("error", "") or "")
+        if error_obj is not None:
+            if "timeout" in str(error_obj).lower():
+                evt = "timeout"
+        if "timeout" in err_txt.lower():
+            evt = "timeout"
+        meta = parsed_for_event.get("meta") or {}
+        if "event" not in meta:
+            meta["event"] = evt
+        unified["meta"] = meta
+    except Exception:
+        pass
+
     agent.history.append({"role": "user", "content": user_prompt})
     agent.history.append({"role": "assistant", "content": raw})
     if len(agent.history) > 60:
@@ -967,6 +1049,72 @@ def run_agent(agent: Agent, row_idx: int) -> Agent:
     agent.last_raw = raw
     agent.last_json = unified
     return agent
+
+
+def _safe_eval_expr(expr: str, env: Dict[str, Any]) -> bool:
+    try:
+        return bool(eval(expr, {"__builtins__": {}}, env))
+    except Exception:
+        return False
+
+
+def _parse_next_spec(next_spec: Any, current_row: int, grid_len: int) -> Optional[Any]:
+    """Return next pointer: int row index, or 'end', or None."""
+    if not next_spec:
+        return None
+    if isinstance(next_spec, dict):
+        if next_spec.get("end"):
+            return "end"
+        if "row" in next_spec:
+            r = next_spec["row"]
+            if isinstance(r, str) and (r.startswith("+") or r.startswith("-")):
+                try:
+                    val = current_row + int(r)
+                    return val
+                except Exception:
+                    return None
+            if isinstance(r, int):
+                return r
+    if isinstance(next_spec, str):
+        if next_spec.lower() in ("end", "loop_end", "finish"):
+            return "end"
+        if next_spec.startswith("+") or next_spec.startswith("-"):
+            try:
+                return current_row + int(next_spec)
+            except Exception:
+                return None
+        try:
+            return int(next_spec)
+        except Exception:
+            return None
+    return None
+
+
+def _evaluate_routes_for_agent(agent: Agent, row_idx: int, grid_len: int) -> Optional[Any]:
+    """Evaluate agent.routes when agent.last_json is available."""
+    if not agent.routes or not isinstance(agent.last_json, dict):
+        return None
+    uni = agent.last_json
+    meta = uni.get("meta") or {}
+    msg = uni.get("message")
+    ok = bool(uni.get("ok"))
+    evt = str(meta.get("event") or ("success" if ok else "error")).lower()
+    for rule in agent.routes:
+        when = str(rule.get("when", "success")).lower()
+        if when not in ("success", "error", "timeout", "always"):
+            when = "success"
+        if when != "always" and evt != when:
+            continue
+        expr = rule.get("expr")
+        if expr:
+            env = {"message": msg, "meta": meta, "ok": ok, "kv": st.session_state.get("global_kv", {})}
+            if not _safe_eval_expr(expr, env):
+                continue
+        to_spec = rule.get("to")
+        nxt = _parse_next_spec(to_spec, row_idx, grid_len)
+        if nxt is not None:
+            return nxt
+    return None
 
 
 # =========================
@@ -1034,8 +1182,38 @@ def step_execute(row_idx: int):
             st.session_state.current_loop_steps.append({})
         st.session_state.current_loop_steps.append(step_result)
 
+    # NEW: evaluate DAG next pointer (priority: meta.next > routes)
+    next_ptr: Optional[Any] = None
+    try:
+        grid_len = len(st.session_state.grid)
+        # 1) meta.next from any agent in this row (first found wins)
+        for ag in st.session_state.grid[row_idx]:
+            uni = ag.last_json if isinstance(ag.last_json, dict) else None
+            if not uni:
+                continue
+            meta = uni.get("meta") or {}
+            nxt_spec = meta.get("next") or meta.get("route")
+            cand = _parse_next_spec(nxt_spec, row_idx, grid_len)
+            if cand is not None:
+                next_ptr = cand
+                break
+        # 2) routes definition on agents (if meta.next absent)
+        if next_ptr is None:
+            for ag in st.session_state.grid[row_idx]:
+                cand = _evaluate_routes_for_agent(ag, row_idx, grid_len)
+                if cand is not None:
+                    next_ptr = cand
+                    break
+    except Exception:
+        next_ptr = None
+
+    st.session_state.__branch_next = next_ptr
+
 def complete_loop_if_needed(row_idx: int):
-    if row_idx == len(st.session_state.grid) - 1:
+    # NEW: consume branch next pointer
+    next_override = st.session_state.pop("__branch_next", None)
+
+    def _finish_loop():
         grid_snapshot = snapshot_current_grid_meta()
         st.session_state.history_loops.append({
             "loop_index": st.session_state.loop_index,
@@ -1045,6 +1223,21 @@ def complete_loop_if_needed(row_idx: int):
         st.session_state.loop_index += 1
         st.session_state.current_loop_steps = []
         st.session_state.current_row = 0
+
+    if next_override == "end":
+        _finish_loop()
+        return
+    if isinstance(next_override, int):
+        if 0 <= next_override < len(st.session_state.grid):
+            st.session_state.current_row = next_override
+            return
+        else:
+            _finish_loop()
+            return
+
+    # default behavior
+    if row_idx == len(st.session_state.grid) - 1:
+        _finish_loop()
     else:
         st.session_state.current_row = row_idx + 1
 
@@ -1503,6 +1696,10 @@ with st.sidebar:
     if st.button("Docワークフロー配置 (サンプル)"):
         load_sample_doc_workflow()
         st.success("Docワークフロー（サンプル）を配置しました")
+
+    if st.button("DAG分岐サンプルをロード"):
+        load_sample_dag_branching()
+        st.success("DAG分岐サンプルを配置しました")
 
     st.markdown("---")
     st.subheader("設定の保存 / 読み込み")
@@ -2090,6 +2287,37 @@ def render_detail():
             agent.user_prompt = t_editor
 
     agent.user_prompt = st.text_area("指示プロンプト（Context とスキーマ制約は自動付与）", value=agent.user_prompt, height=220, key=f"detail_user_{agent.id}")
+
+    # --- 新規: 実行制御パネル (retries/backoff/timeout/expected_schema/routes) ---
+    with st.expander("実行制御（リトライ/バックオフ/タイムアウト/スキーマ/ルート）", expanded=False):
+        colx, coly, colz = st.columns(3)
+        with colx:
+            agent.retries = int(st.number_input("retries", 0, 10, int(agent.retries), 1, key=f"detail_retries_{agent.id}"))
+            agent.backoff = float(st.number_input("backoff (指数)", 1.0, 10.0, float(agent.backoff), 0.5, key=f"detail_backoff_{agent.id}"))
+        with coly:
+            agent.timeout = int(st.number_input("timeout (sec)", 5, 300, int(agent.timeout), 5, key=f"detail_timeout_{agent.id}"))
+        with colz:
+            st.caption("OK=false, timeout等は meta.event に自動反映されます。")
+
+        # expected_schema (JSON)
+        schema_txt = json_pretty(agent.expected_schema) if agent.expected_schema else ""
+        schema_new = st.text_area("expected_schema (JSON, 任意)", value=schema_txt, height=120, key=f"detail_schema_{agent.id}")
+        if st.button("スキーマを適用", key=f"apply_schema_{agent.id}"):
+            try:
+                agent.expected_schema = json.loads(schema_new) if schema_new.strip() else None
+                st.success("スキーマを設定しました")
+            except Exception as e:
+                st.error(f"JSON パース失敗: {e}")
+
+        # routes (JSON)
+        routes_txt = json_pretty(agent.routes) if agent.routes else ""
+        routes_new = st.text_area("routes (JSON, 任意)", value=routes_txt, height=150, key=f"detail_routes_{agent.id}")
+        if st.button("ルートを適用", key=f"apply_routes_{agent.id}"):
+            try:
+                agent.routes = json.loads(routes_new) if routes_new.strip() else []
+                st.success("ルーティングを設定しました")
+            except Exception as e:
+                st.error(f"JSON パース失敗: {e}")
 
     # --- 追加: 詳細画面で LLM に送られる『生データ』を確認できる折りたたみ表示 ---
     # construct the same user_prompt / messages as run_agent would do so the user can inspect
