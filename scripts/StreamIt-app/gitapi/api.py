@@ -28,9 +28,11 @@ class GitApiClient:
         self.owner = owner
         self.repo = repo
         self.headers = {
-            "Authorization": f"token {token}",
             "Accept": "application/vnd.github+json",
         }
+        # Only include Authorization header when a token is provided.
+        if token:
+            self.headers["Authorization"] = f"token {token}"
 
     def _request(
         self,
@@ -87,6 +89,22 @@ class GitApiClient:
             return data.get("sha") if isinstance(data, dict) else None
         except RuntimeError as e:
             # If not found, the API returns 404; surface as None
+            if "404" in str(e):
+                return None
+            raise
+
+    def get_file(self, path: str, ref: Optional[str] = None) -> Optional[str]:
+        """Return decoded file content for a path on the repository (or None if not found)."""
+        try:
+            params = {"ref": ref} if ref else None
+            data = self._get(f"/repos/{self.owner}/{self.repo}/contents/{path}", params=params)
+            if isinstance(data, dict):
+                content = data.get("content")
+                encoding = data.get("encoding", "base64")
+                if content and encoding == "base64":
+                    return base64.b64decode(content.encode("utf-8")).decode("utf-8")
+            return None
+        except RuntimeError as e:
             if "404" in str(e):
                 return None
             raise

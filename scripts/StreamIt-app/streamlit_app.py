@@ -6,6 +6,7 @@ import re
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import streamlit as st
@@ -223,6 +224,181 @@ def init_doc_kv_if_missing():
     kv.setdefault("repo_info", {"root": "/repo/docs", "path": "runbooks/job-acl.md"})
 
 
+def _repo_workspace_root() -> str:
+    """Return the filesystem path to the repository workspace root.
+    Heuristics: REPO_ROOT env var -> global_kv.repo_info.root (if absolute) -> two levels up from this file.
+    """
+    # 1) env
+    env_root = os.environ.get("REPO_ROOT")
+    if env_root:
+        return os.path.abspath(env_root)
+    # 2) global_kv
+    try:
+        rv = st.session_state.global_kv.get("repo_info", {}).get("root")
+        if rv:
+            # if absolute path, use as-is; if relative, make relative to workspace
+            if os.path.isabs(rv):
+                return os.path.abspath(rv)
+            # relative: treat relative to workspace two levels up
+            base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+            return os.path.abspath(os.path.join(base, rv.lstrip('/\\')))
+    except Exception:
+        pass
+    # 3) default: two levels up from this file (repo root)
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+def detect_local_git_branch() -> Optional[str]:
+    """Try to detect current branch name from .git/HEAD in the repo root.
+
+    Returns branch name like 'main' or None if not detectable.
+    """
+    try:
+        root = _repo_workspace_root()
+        head_path = os.path.join(root, '.git', 'HEAD')
+        if os.path.exists(head_path):
+            with open(head_path, 'r', encoding='utf-8') as fh:
+                txt = fh.read().strip()
+            if txt.startswith('ref:'):
+                # format: ref: refs/heads/main
+                ref = txt.split(None, 1)[1].strip()
+                parts = ref.split('/')
+                if parts:
+                    return parts[-1]
+            # detached HEAD or other format
+            return None
+    except Exception:
+        return None
+    return None
+
+
+def repo_fs_path(path_in_repo: str) -> str:
+    """Return absolute filesystem path for a repo-relative path (path_in_repo).
+    """
+    base = _repo_workspace_root()
+    return os.path.abspath(os.path.join(base, path_in_repo.lstrip('/\\')))
+
+
+def read_repo_file(path_in_repo: str) -> tuple[bool, Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Return (ok, content_or_error, used_path, source_display, target_url, git_message).
+
+    target_url: the raw URL or API URL used to fetch (if remote) or absolute local path
+    git_message: when local, attempt to detect HEAD sha and last commit message
+    """
+    p = repo_fs_path(path_in_repo)
+    try:
+        # If remote repo is configured, prefer remote fetch (file_path first)
+        cfg = load_github_config()
+        token = cfg.get("token")
+        owner = cfg.get("owner")
+        repo = cfg.get("repo")
+        base_branch = cfg.get("base_branch") or 'main'
+        if owner and repo:
+            try:
+                client = GitApiClient(token=(token or ""), owner=owner, repo=repo)
+                tried_paths = []
+                for candidate in (cfg.get("file_path"), path_in_repo):
+                    if not candidate:
+                        continue
+                    cand = candidate.lstrip("/\\")
+                    if cand in tried_paths:
+                        continue
+                    tried_paths.append(cand)
+                    try:
+                        remote = client.get_file(cand, ref=base_branch)
+                    except Exception as e:
+                        remote = None
+                        last_err = str(e)
+                    else:
+                        last_err = None
+                    if remote is not None:
+                        src = f"{owner}/{repo}@{base_branch}"
+                        raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{base_branch}/{cand}"
+                        return True, remote, cand, src, raw_url, None
+                # remote not found; fall back to local if exists
+            except Exception:
+                # proceed to local fallback
+                pass
+
+        # local fallback
+        if os.path.exists(p):
+            with open(p, 'r', encoding='utf-8') as fh:
+                content = fh.read()
+            branch = detect_local_git_branch()
+            src = f"local ({branch})" if branch else 'local'
+            # attempt to get local reflog message
+            git_msg = None
+            try:
+                root = _repo_workspace_root()
+                if branch:
+                    logs_path = os.path.join(root, '.git', 'logs', 'refs', 'heads', branch)
+                    if os.path.exists(logs_path):
+                        with open(logs_path, 'r', encoding='utf-8', errors='ignore') as lf:
+                            lines = [ln.strip() for ln in lf.readlines() if ln.strip()]
+                        if lines:
+                            last = lines[-1]
+                            if '\t' in last:
+                                git_msg = last.split('\t', 1)[1]
+                            else:
+                                parts = last.split()
+                                if parts:
+                                    git_msg = parts[-1]
+            except Exception:
+                git_msg = None
+            local_abs = p
+            return True, content, path_in_repo, src, local_abs, git_msg
+
+        return False, f"not found: {p}", None, None, None, None
+    except Exception as e:
+        return False, str(e), None, None, None, None
+
+
+def write_repo_file(path_in_repo: str, content: str) -> tuple[bool, Optional[str]]:
+    p = repo_fs_path(path_in_repo)
+    try:
+        # If GitHub config with token is available, attempt remote push (branch + file + PR)
+        try:
+            cfg = load_github_config()
+            token = cfg.get("token")
+            owner = cfg.get("owner")
+            repo = cfg.get("repo")
+            # read-branch used as the base for creating the write branch if needed
+            base_for_create = cfg.get("base_branch_read") or cfg.get("base_branch") or "main"
+            write_branch = cfg.get("base_branch_write") or cfg.get("base_branch") or None
+            file_path = cfg.get("file_path") or path_in_repo
+            if token and owner and repo:
+                client = GitApiClient(token=token, owner=owner, repo=repo)
+                # target branch to update/create
+                branch_name = write_branch if write_branch else f"streamlit/write_{uuid.uuid4().hex[:8]}"
+                try:
+                    # attempt to create the branch from base_for_create; if it exists this may error which we ignore
+                    client.create_branch(branch_name, base_for_create)
+                except Exception:
+                    # branch already exists or creation failed; continue and try to put file
+                    pass
+                commit_msg = f"Update {file_path} via StreamIt"
+                try:
+                    client.put_file(path=file_path, content=content, branch=branch_name, message=commit_msg)
+                    return True, f"remote updated branch {branch_name}"
+                except Exception as e:
+                    # fall back to local write if remote push fails
+                    fallback_err = str(e)
+        except Exception:
+            fallback_err = None
+
+        # local write fallback
+        d = os.path.dirname(p)
+        os.makedirs(d, exist_ok=True)
+        with open(p, 'w', encoding='utf-8') as fh:
+            fh.write(content)
+        info = p
+        if 'fallback_err' in locals() and fallback_err:
+            info = f"local write succeeded, remote push failed: {fallback_err}"
+        return True, info
+    except Exception as e:
+        return False, str(e)
+
+
 def set_kv_json(key: str, text: str):
     try:
         val = json.loads(text)
@@ -358,6 +534,84 @@ def load_sample_doc_workflow():
     st.session_state.current_row = 0
     st.session_state.loaded_sample = True
     safe_rerun()
+
+
+# --- GitHub config loader (centralized) ---
+def load_github_config() -> Dict[str, Optional[str]]:
+    """Load GitHub related config with precedence: env -> secrets.toml -> session global_kv -> defaults.
+
+    Returns a dict with keys: token, owner, repo, base_branch, file_path
+    """
+    cfg: Dict[str, Optional[str]] = {
+        "token": None,
+        "owner": None,
+        "repo": None,
+        "base_branch": None,
+        "base_branch_read": None,
+        "base_branch_write": None,
+        "file_path": None,
+    }
+
+    # 1) try secrets.toml first (user requested: token stored in secrets.toml)
+    toml_loader = None
+    try:
+        import tomllib as toml_loader  # type: ignore
+    except Exception:
+        try:
+            import toml as toml_loader  # type: ignore
+        except Exception:
+            toml_loader = None
+
+    if toml_loader is not None:
+        s_path = os.path.join(os.path.dirname(__file__), "secrets.toml")
+        try:
+            if os.path.exists(s_path):
+                with open(s_path, "r", encoding="utf-8") as fh:
+                    text = fh.read()
+                try:
+                    data = toml_loader.loads(text)
+                except Exception:
+                    try:
+                        import toml as _toml
+                        data = _toml.loads(text)
+                    except Exception:
+                        data = {}
+                cfg["token"] = data.get("GITHUB_TOKEN") or data.get("LLM_API_KEY") or cfg["token"]
+                cfg["owner"] = data.get("GITHUB_OWNER") or cfg["owner"]
+                cfg["repo"] = data.get("GITHUB_REPO") or cfg["repo"]
+                cfg["base_branch"] = data.get("BASE_BRANCH") or cfg["base_branch"]
+                cfg["base_branch_read"] = data.get("BASE_BRANCH_READ") or data.get("BASE_BRANCH") or cfg.get("base_branch_read")
+                cfg["base_branch_write"] = data.get("BASE_BRANCH_WRITE") or data.get("BASE_BRANCH") or cfg.get("base_branch_write")
+                cfg["file_path"] = data.get("FILE_PATH") or cfg["file_path"]
+        except Exception:
+            pass
+
+    # 2) overlay environment variables (use when secrets.toml not present)
+    cfg["token"] = cfg["token"] or os.environ.get("GITHUB_TOKEN")
+    cfg["owner"] = cfg["owner"] or os.environ.get("GITHUB_OWNER")
+    cfg["repo"] = cfg["repo"] or os.environ.get("GITHUB_REPO")
+    cfg["base_branch"] = cfg["base_branch"] or os.environ.get("BASE_BRANCH")
+    cfg["base_branch_read"] = cfg.get("base_branch_read") or os.environ.get("BASE_BRANCH_READ")
+    cfg["base_branch_write"] = cfg.get("base_branch_write") or os.environ.get("BASE_BRANCH_WRITE")
+    cfg["file_path"] = cfg["file_path"] or os.environ.get("FILE_PATH")
+
+    # 3) fallback to session_state.global_kv
+    gkv = st.session_state.get("global_kv", {}) or {}
+    cfg["token"] = cfg["token"] or gkv.get("GITHUB_TOKEN") or gkv.get("github_token")
+    cfg["owner"] = cfg["owner"] or gkv.get("GITHUB_OWNER") or gkv.get("github_owner")
+    cfg["repo"] = cfg["repo"] or gkv.get("GITHUB_REPO") or gkv.get("github_repo")
+    cfg["base_branch"] = cfg["base_branch"] or gkv.get("BASE_BRANCH") or gkv.get("base_branch")
+    cfg["base_branch_read"] = cfg.get("base_branch_read") or gkv.get("BASE_BRANCH_READ") or gkv.get("base_branch_read")
+    cfg["base_branch_write"] = cfg.get("base_branch_write") or gkv.get("BASE_BRANCH_WRITE") or gkv.get("base_branch_write")
+    # final default
+    cfg["base_branch_read"] = cfg.get("base_branch_read") or cfg.get("base_branch") or "main"
+    cfg["base_branch_write"] = cfg.get("base_branch_write") or cfg.get("base_branch") or "main"
+    cfg["file_path"] = cfg["file_path"] or gkv.get("FILE_PATH") or gkv.get("file_path") or "docs/runbooks/job-acl.md"
+
+    # final hardcoded fallbacks
+    cfg["owner"] = cfg["owner"] or "daisuke0323c-code"
+    cfg["repo"] = cfg["repo"] or "runbook-sandbox"
+    return cfg
 
 def build_response_row_from_agents(row_idx_abs: int) -> List[Dict[str, Any]]:
     cells = []
@@ -1111,79 +1365,28 @@ def render_main():
             st.session_state.global_kv["target_doc"] = td_new
             st.success("target_doc を更新しました")
         # PR 作成用ボタン: target_doc の内容をリポジトリにアップして PR を作る
-        if st.button("target_doc で PR を作成", key="create_pr_from_target_doc"):
-            # read config from env, secrets.toml, or global_kv defaults
-            def load_github_config():
-                # priority: environment variables -> secrets.toml in StreamIt-app -> st.session_state.global_kv -> hardcoded fallback
-                cfg = {}
-                cfg['token'] = os.environ.get('GITHUB_TOKEN')
-                cfg['owner'] = os.environ.get('GITHUB_OWNER')
-                cfg['repo'] = os.environ.get('GITHUB_REPO')
-                cfg['base_branch'] = os.environ.get('BASE_BRANCH')
-                cfg['file_path'] = os.environ.get('FILE_PATH')
-                # try reading secrets.toml if any value missing
-                try:
-                    import tomllib
-                except Exception:
-                    try:
-                        import toml as tomllib  # type: ignore
-                    except Exception:
-                        tomllib = None
-                if tomllib is not None:
-                    s_path = os.path.join(os.path.dirname(__file__), 'secrets.toml')
-                    try:
-                        if os.path.exists(s_path):
-                            # read as text then parse to avoid binary/str read type issues
-                            with open(s_path, 'r', encoding='utf-8') as fh:
-                                text = fh.read()
-                            try:
-                                data = tomllib.loads(text)
-                            except Exception:
-                                # fallback for third-party toml module
-                                import toml as _toml
-                                data = _toml.loads(text)
-                            # common keys (example): GITHUB_TOKEN, GITHUB_OWNER ...
-                            cfg['token'] = cfg['token'] or data.get('GITHUB_TOKEN') or data.get('LLM_API_KEY')
-                            cfg['owner'] = cfg['owner'] or data.get('GITHUB_OWNER')
-                            cfg['repo'] = cfg['repo'] or data.get('GITHUB_REPO')
-                            cfg['base_branch'] = cfg['base_branch'] or data.get('BASE_BRANCH')
-                            cfg['file_path'] = cfg['file_path'] or data.get('FILE_PATH')
-                    except Exception:
-                        pass
-
-                # fallback to st.session_state.global_kv
-                gkv = st.session_state.get('global_kv', {}) or {}
-                cfg['token'] = cfg['token'] or gkv.get('GITHUB_TOKEN') or gkv.get('github_token')
-                cfg['owner'] = cfg['owner'] or gkv.get('GITHUB_OWNER') or gkv.get('github_owner')
-                cfg['repo'] = cfg['repo'] or gkv.get('GITHUB_REPO') or gkv.get('github_repo')
-                cfg['base_branch'] = cfg['base_branch'] or gkv.get('BASE_BRANCH') or gkv.get('base_branch') or 'main'
-                cfg['file_path'] = cfg['file_path'] or gkv.get('FILE_PATH') or gkv.get('file_path') or 'docs/runbooks/job-acl.md'
-
-                # final hardcoded fallbacks (avoid embedding real tokens)
-                cfg['owner'] = cfg['owner'] or 'daisuke0323c-code'
-                cfg['repo'] = cfg['repo'] or 'runbook-sandbox'
-                return cfg
-
+    if st.button("target_doc で PR を作成", key="create_pr_from_target_doc"):
+            # use centralized loader which reads secrets.toml (preferred) -> env -> global_kv
             cfg = load_github_config()
             token = cfg.get('token')
             owner = cfg.get('owner')
             repo = cfg.get('repo')
-            base_branch = cfg.get('base_branch')
-            file_path = cfg.get('file_path')
+            base_branch = cfg.get('base_branch') or 'main'
+            file_path = cfg.get('file_path') or 'docs/runbooks/job-acl.md'
             if not token or not owner or not repo:
                 st.error("GITHUB_TOKEN / GITHUB_OWNER / GITHUB_REPO が未設定です。環境変数か global_kv に設定してください。")
             else:
                 client = GitApiClient(token=token, owner=owner, repo=repo)
                 branch_name = f"streamlit/target_doc_{uuid.uuid4().hex[:8]}"
                 try:
-                    client.create_branch(branch_name, base_branch)
+                    client.create_branch(branch_name, str(base_branch))
                     content = td_new or st.session_state.global_kv.get("target_doc", "")
                     commit_msg = f"Update target_doc from Streamlit {branch_name}"
-                    client.put_file(path=file_path, content=content, branch=branch_name, message=commit_msg)
+                    client.put_file(path=str(file_path), content=content, branch=branch_name, message=commit_msg)
                     pr = client.create_pull_request(
                         title="Update target_doc via Streamlit",
                         head=branch_name,
-                        base=base_branch,
+                        base=str(base_branch),
                         body="Automated update from Streamlit app",
                     )
                     # GitApiClient.create_pull_request may return a URL string or a dict
@@ -1200,6 +1403,71 @@ def render_main():
                     st.error(f"PR 作成に失敗しました: {e}")
     with c2:
         st.caption("Editor が kv_patch.target_doc を返すと、ここが自動更新されます。")
+    # --- リポジトリ読み書きボタン ---
+    repo_path = st.session_state.global_kv.get('repo_info', {}).get('path')
+    rp_display = repo_path or '(repo_info.path が未設定)'
+    st.caption(f"リポジトリファイル: {rp_display}")
+    r1, r2 = st.columns([1,1])
+    with r1:
+        if st.button("リポジトリから読み込む"):
+            if not repo_path:
+                st.error('st.session_state.global_kv["repo_info"]["path"] が未設定です')
+            else:
+                # show source info
+                cfg = load_github_config()
+                owner = cfg.get("owner")
+                repo = cfg.get("repo")
+                base_branch = cfg.get("base_branch") or 'main'
+                src_display = f"{owner}/{repo}@{base_branch}" if owner and repo else "(リモート未設定)"
+                st.info(f"取得元: {src_display}")
+                ok, data, used_path, src, target_url, git_msg = read_repo_file(repo_path)
+                # persist last fetch info so it doesn't disappear
+                st.session_state['last_repo_fetch'] = {
+                    'ts': datetime.now().isoformat(),
+                    'ok': bool(ok),
+                    'used_path': used_path,
+                    'source': src or src_display,
+                    'target_url': target_url,
+                    'git_message': git_msg,
+                    'message': data if not ok else '読み込み成功',
+                }
+                if ok:
+                    st.session_state.global_kv['target_doc'] = data
+                    # indicate whether data came from local path or remote
+                    p = repo_fs_path(repo_path)
+                    if os.path.exists(p):
+                        st.success(f"読み込み成功 (ローカル): {p}")
+                    else:
+                        st.success(
+                            f"読み込み成功 (リモート {st.session_state['last_repo_fetch']['source']}): {used_path or repo_path}"
+                        )
+                    safe_rerun()
+                else:
+                    # include branch/source hint in error
+                    st.error(f"読み込み失敗 ({st.session_state['last_repo_fetch']['source']}): {data}")
+    with r2:
+        if st.button("リポジトリに書き込む"):
+            if not repo_path:
+                st.error('st.session_state.global_kv["repo_info"]["path"] が未設定です')
+            else:
+                content = td_new or st.session_state.global_kv.get('target_doc', '')
+                ok, info = write_repo_file(repo_path, content)
+                if ok:
+                    st.success(f"書き込み成功: {info}")
+                else:
+                    st.error(f"書き込み失敗: {info}")
+
+    # persistent display of last repo fetch info
+    last = st.session_state.get('last_repo_fetch')
+    if last:
+        with st.expander("前回のリポジトリ取得情報", expanded=True):
+            st.write(f"時刻: {last.get('ts')}")
+            st.write(f"成功: {last.get('ok')}")
+            st.write(f"取得元: {last.get('source')}")
+            st.write(f"使用パス: {last.get('used_path')}")
+            st.write(f"対象URL: {last.get('target_url')}")
+            st.write(f"git message: {last.get('git_message')}")
+            st.write(f"備考: {last.get('message')}")
 
     # --- Doc KV 編集エリア ---
     with st.expander("情報源とルールを編集 (sources / style / lint)", expanded=False):
