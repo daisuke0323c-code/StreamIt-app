@@ -13,7 +13,7 @@ from gitapi.api import GitApiClient
 from openai import OpenAI
 
 # =========================
-# Util / JSON helper s
+# Util / JSON helper
 # =========================
 
 def safe_rerun():
