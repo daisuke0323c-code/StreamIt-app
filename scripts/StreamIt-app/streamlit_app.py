@@ -465,10 +465,8 @@ def ensure_state():
         st.session_state.global_kv = {}
     # optional: try to import streamlit-sortables once and set availability flag
     if "_SORTABLES_AVAILABLE" not in st.session_state:
-        try:
-            st.session_state._SORTABLES_AVAILABLE = True
-        except Exception:
-            st.session_state._SORTABLES_AVAILABLE = False
+        # Use the module-level detection performed at import time, fall back to False
+        st.session_state._SORTABLES_AVAILABLE = bool(globals().get("_SORTABLES_AVAILABLE", False))
     if "defaults" not in st.session_state:
         st.session_state.defaults = {
             "model": "gpt-4o-mini",
@@ -734,12 +732,12 @@ def set_sample_doc_kv():
         "[2024-08-03 10:13] ops-b: 反映は pjctl reload-acl コマンド推奨。手順Runbook古いかも。",
         "[2024-08-20 22:31] oncall: ジョブ投入失敗(ACL)の暫定回避手順を追記したい。"
     ]
-    kv["sources_confluence"] = [
-        {"title": "旧Runbook: ACL更新手順", "url": "https://conf/ops/acl", "body": "ACLの更新は /etc/pj_acl を編集後、サービス再起動（古い）"},
-        {"title": "障害対応ログ（2024-08-20）", "url": "https://conf/ops/incidents/20240820", "body": "ACL不整合でジョブ投入失敗。対処: pjctl reload-acl 実行。検証: pjstat で権限確認。"}
+    # Sample: replace Confluence/PDF with Word/Excel download samples
+    kv["sources_word"] = [
+        {"title": "運用手順.docx", "url": "https://files.example.com/ops/runbook.docx", "note": "最新の運用手順が含まれるWordドキュメント"}
     ]
-    kv["sources_pdfs"] = [
-        "FugakuOpsGuide_v3.2.pdf p.45 ACL運用: reload-aclコマンドで反映。旧手順は非推奨。"
+    kv["sources_excel"] = [
+        {"title": "ジョブ一覧.xlsx", "url": "https://files.example.com/ops/job_list.xlsx", "note": "ジョブ定義とACL情報を含むExcelシート"}
     ]
     kv["target_doc"] = (
         "# 富岳運用 Runbook: ジョブACLと障害対応\n\n"
@@ -817,15 +815,15 @@ def load_sample_doc_workflow():
     )
 
     st.session_state.grid = [
-        [new_agent("Collector Slack"), new_agent("Collector Confluence"), new_agent("Collector PDF")],
+        [new_agent("Collector Slack"), new_agent("Collector Word (download)"), new_agent("Collector Excel (download)")],
         [new_agent("Normalizer"), new_agent("Linter")],
         [new_agent("Judge"), new_agent("Editor")]
     ]
 
     # プロンプト設定
     st.session_state.grid[0][0].user_prompt = p_collector("sources_slack", "Slackログ")
-    st.session_state.grid[0][1].user_prompt = p_collector("sources_confluence", "Confluence/古いRunbook/障害ログ")
-    st.session_state.grid[0][2].user_prompt = p_collector("sources_pdfs", "PDF資料")
+    st.session_state.grid[0][1].user_prompt = p_collector("sources_word", "Word ダウンロード (runbook.docx)")
+    st.session_state.grid[0][2].user_prompt = p_collector("sources_excel", "Excel ダウンロード (job_list.xlsx)")
 
     st.session_state.grid[1][0].user_prompt = p_normalizer
     st.session_state.grid[1][1].user_prompt = p_linter
@@ -2079,6 +2077,376 @@ def render_main():
 
     # --- Doc KV 編集エリア ---
     with st.expander("情報源とルールを編集 (sources / style / lint)", expanded=False):
+        st.markdown("**ファイルアップロード (Excel / Word)**")
+        cu1, cu2 = st.columns(2)
+        with cu1:
+            excel_file = st.file_uploader("Excel をアップロード (.xlsx .xls .xlsm)", type=["xlsx", "xls", "xlsm"], key="upload_excel")
+            if excel_file is not None:
+                import tempfile as _tempfile
+                from pathlib import Path as _Path
+
+                import pandas as _pd
+                try:
+                    # Save temporary file
+                    with _tempfile.NamedTemporaryFile(delete=False, suffix=_Path(excel_file.name).suffix) as _tmp:
+                        _tmp.write(excel_file.read())
+                        _tmp_path = _tmp.name
+
+                    # read with pandas (let pandas choose engine)
+                    _xls = _pd.ExcelFile(_tmp_path)
+                    md_parts = []
+                    for _sheet in _xls.sheet_names:
+                        _df = _xls.parse(_sheet, header=None).fillna("")
+                        _md = _df.to_markdown(index=False)
+                        # normalize consecutive spaces -> single space
+                        _md_norm = _md.replace('  ', ' ')
+                        # repeat until no double spaces remain
+                        while '  ' in _md_norm:
+                            _md_norm = _md_norm.replace('  ', ' ')
+                        md_parts.append(f"## {_sheet}\n\n{_md_norm}")
+
+                    _all_md = "\n\n".join(md_parts)
+                    st.code(_all_md, language='markdown')
+                    st.download_button("Download Markdown (Excel)", data=_all_md.encode('utf-8'), file_name=f"{_Path(excel_file.name).stem}.md", mime='text/markdown')
+
+                    # Optional LLM restore
+                    if st.button("LLM による復元・整形（Excel）"):
+                        try:
+                            client = get_openai_client()
+                            prompt = (
+                                "以下は Excel を Markdown に変換した内容です。元の表の内容を再構成し、整形して分かりやすく出力してください。\n\n" + _all_md
+                            )
+                            messages_for_llm = [{"role": "user", "content": prompt}]
+                            # store raw messages/prompt for inspection in Context
+                            try:
+                                st.session_state.global_kv["last_llm_messages"] = messages_for_llm
+                                st.session_state.global_kv["last_llm_prompt"] = prompt
+                                st.session_state.global_kv["last_llm_model"] = "gpt-4o-mini"
+                                # also save per-file raw payload for this upload
+                                try:
+                                    from datetime import datetime as _dt
+                                    st.session_state.global_kv["sources_excel_raw"] = {
+                                        "messages": messages_for_llm,
+                                        "prompt": prompt,
+                                        "model": "gpt-4o-mini",
+                                        "file": _Path(excel_file.name).name,
+                                        "ts": _dt.utcnow().isoformat() + "Z",
+                                    }
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                            resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages_for_llm)
+                            out = resp.choices[0].message.content
+                            st.text_area("LLM 復元結果 (Excel)", value=out, height=300)
+
+                            # Try to parse JSON from LLM output and store into sources_excel
+                            import json as _json
+                            import re as _re
+
+                            def _extract_first_json(s: str):
+                                # naive: find the first {...} or [ ... ] block
+                                m = _re.search(r"(\{[\s\S]*?\})", s)
+                                if m:
+                                    return m.group(1)
+                                m = _re.search(r"(\[[\s\S]*?\])", s)
+                                if m:
+                                    return m.group(1)
+                                return None
+
+                            parsed = None
+                            try:
+                                parsed = _json.loads(out)
+                            except Exception:
+                                js = _extract_first_json(out)
+                                if js:
+                                    try:
+                                        parsed = _json.loads(js)
+                                    except Exception:
+                                        parsed = None
+
+                            if parsed is not None:
+                                # normalize to list
+                                val = parsed
+                                if isinstance(val, dict):
+                                    val = [val]
+                                # add metadata for uploaded file at the front if missing
+                                try:
+                                    meta = {"title": _Path(excel_file.name).name, "url": f"uploaded://{_Path(excel_file.name).name}", "note": f"Uploaded Excel: {_Path(excel_file.name).name}"}
+                                    if not any(isinstance(it, dict) and it.get("title") == meta["title"] for it in val):
+                                        val.insert(0, meta)
+                                except Exception:
+                                    pass
+                                st.session_state.global_kv["sources_excel"] = val
+                                st.success("LLM 復元結果を sources_excel に自動保存しました")
+                            else:
+                                st.info("LLM の結果から JSON を抽出できませんでした。手動でコピーしてください。")
+                        except Exception as _e:
+                            st.error(f"LLM 呼び出しに失敗: {_e}")
+                except Exception as _ex:
+                    st.error(f"Excel の処理に失敗しました: {_ex}")
+                finally:
+                    try:
+                        import os as _os
+                        _os.remove(_tmp_path)
+                    except Exception:
+                        pass
+        with cu2:
+            word_file = st.file_uploader("Word をアップロード (.docx)", type=["docx"], key="upload_word")
+            if word_file is not None:
+                import tempfile as _tempfile
+                from pathlib import Path as _Path
+                try:
+                    with _tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as _tmp:
+                        _tmp.write(word_file.read())
+                        _tmp_path = _tmp.name
+
+                    try:
+                        import pypandoc as _pyp
+                        # try conversion
+                        out_md_path = _tmp_path + '.md'
+                        try:
+                            _pyp.convert_file(_tmp_path, 'md', outputfile=out_md_path, extra_args=['--standalone'])
+                        except Exception as _ce:
+                            # try downloading pandoc automatically
+                            try:
+                                _pyp.download_pandoc()
+                                _pyp.convert_file(_tmp_path, 'md', outputfile=out_md_path, extra_args=['--standalone'])
+                            except Exception as _dle:
+                                raise RuntimeError(f"pandoc not found and download failed: {_dle}") from _dle
+
+                        with open(out_md_path, 'r', encoding='utf-8') as _f:
+                            _md = _f.read()
+                        st.code(_md, language='markdown')
+                        st.download_button("Download Markdown (Word)", data=_md.encode('utf-8'), file_name=f"{_Path(word_file.name).stem}.md", mime='text/markdown')
+
+                        # Automatic LLM restore on upload (run once per uploaded filename)
+                        try:
+                            proc_flag = f"processed_word_{_Path(word_file.name).name}"
+                        except Exception:
+                            proc_flag = None
+
+                        if proc_flag is None or not st.session_state.get(proc_flag, False):
+                            try:
+                                client = get_openai_client()
+                                prompt = (
+                                    "以下は Word を Markdown に変換した内容です。元のセクションや表を再構成し、整形して分かりやすく出力してください。\n\n" + _md
+                                )
+                                messages_for_llm = [{"role": "user", "content": prompt}]
+                                # store raw messages/prompt and per-file payload
+                                try:
+                                    st.session_state.global_kv["last_llm_messages"] = messages_for_llm
+                                    st.session_state.global_kv["last_llm_prompt"] = prompt
+                                    st.session_state.global_kv["last_llm_model"] = "gpt-4o-mini"
+                                    from datetime import datetime as _dt
+                                    st.session_state.global_kv["sources_word_raw"] = {
+                                        "messages": messages_for_llm,
+                                        "prompt": prompt,
+                                        "model": "gpt-4o-mini",
+                                        "file": _Path(word_file.name).name,
+                                        "ts": _dt.utcnow().isoformat() + "Z",
+                                    }
+                                except Exception:
+                                    pass
+
+                                resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages_for_llm)
+                                out = resp.choices[0].message.content
+                                # persist the raw LLM output for later reprocessing
+                                try:
+                                    st.session_state.global_kv["last_llm_out"] = out
+                                except Exception:
+                                    pass
+                                st.text_area("LLM 復元結果 (Word)", value=out, height=300)
+
+                                # Try to parse JSON from LLM output and store into sources_word
+                                import json as _json
+                                import re as _re
+
+                                def _extract_first_json(s: str):
+                                    if not s:
+                                        return None
+                                    m = _re.search(r"(\{[\s\S]*?\})", s)
+                                    if m:
+                                        return m.group(1)
+                                    m = _re.search(r"(\[[\s\S]*?\])", s)
+                                    if m:
+                                        return m.group(1)
+                                    return None
+
+                                parsed = None
+                                try:
+                                    parsed = _json.loads(out)
+                                except Exception:
+                                    # try to extract JSON inside ```json``` blocks first
+                                    js = None
+                                    m = _re.search(r"```json\s*([\s\S]*?)```", out, _re.IGNORECASE)
+                                    if m:
+                                        js = m.group(1).strip()
+                                    if not js:
+                                        # try any code fence
+                                        m2 = _re.search(r"```[\s\S]*?```", out)
+                                        if m2:
+                                            inner = m2.group(0)
+                                            # strip the backticks
+                                            inner = inner.strip('`')
+                                            js = inner.strip()
+                                    if not js:
+                                        # fallback to naive {..} or [..] extraction
+                                        js = _extract_first_json(out)
+
+                                    if js:
+                                        try:
+                                            parsed = _json.loads(js)
+                                        except Exception:
+                                            parsed = None
+
+                                # If still not parsed, ask the model to extract JSON-only from the previous output
+                                if parsed is None:
+                                    try:
+                                        # build a focused extraction prompt
+                                        extractor_prompt = (
+                                            "あなたはJSON抽出器です。以下のテキストから JSON データだけを抽出して、何も追加せずに純粋な JSON として出力してください。"
+                                            " テキスト:\n\n" + out
+                                        )
+                                        extractor_msgs = [
+                                            {"role": "system", "content": "You are a JSON extractor. Return only JSON and nothing else."},
+                                            {"role": "user", "content": extractor_prompt},
+                                        ]
+                                        # save retry messages
+                                        try:
+                                            st.session_state.global_kv.setdefault("last_llm_retries", [])
+                                            st.session_state.global_kv["last_llm_retries"].append({
+                                                "messages": extractor_msgs,
+                                                "ts": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+                                            })
+                                        except Exception:
+                                            pass
+
+                                        retry_resp = client.chat.completions.create(model="gpt-4o-mini", messages=extractor_msgs, temperature=0)
+                                        retry_out = retry_resp.choices[0].message.content
+                                        # try same extraction techniques on retry_out
+                                        try:
+                                            parsed = _json.loads(retry_out)
+                                        except Exception:
+                                            js2 = _re.search(r"```json\s*([\s\S]*?)```", retry_out, _re.IGNORECASE)
+                                            if js2:
+                                                try:
+                                                    parsed = _json.loads(js2.group(1))
+                                                except Exception:
+                                                    parsed = None
+                                            else:
+                                                js2 = _extract_first_json(retry_out)
+                                                if js2:
+                                                    try:
+                                                        parsed = _json.loads(js2)
+                                                    except Exception:
+                                                        parsed = None
+                                    except Exception:
+                                        parsed = None
+
+                                if parsed is not None:
+                                    # normalize to list
+                                    val = parsed
+                                    if isinstance(val, dict):
+                                        val = [val]
+                                    # add metadata for uploaded file at the front if missing
+                                    try:
+                                        meta = {
+                                            "title": _Path(word_file.name).name,
+                                            "url": f"uploaded://{_Path(word_file.name).name}",
+                                            "note": f"Uploaded Word: {_Path(word_file.name).name}",
+                                        }
+                                        if not any(isinstance(it, dict) and it.get("title") == meta["title"] for it in val):
+                                            val.insert(0, meta)
+                                    except Exception:
+                                        pass
+                                    st.session_state.global_kv["sources_word"] = val
+                                    st.success("LLM 復元結果を sources_word に保存しました")
+                                else:
+                                    st.info("LLM の結果から JSON を抽出できませんでした。手動でコピーしてください。")
+
+                                # mark processed to avoid rerunning on rerun
+                                if proc_flag:
+                                    st.session_state[proc_flag] = True
+                            except Exception as _e:
+                                st.error(f"LLM 呼び出しに失敗: {_e}")
+                                if proc_flag:
+                                    st.session_state[proc_flag] = True
+
+                    except Exception as _e2:
+                        st.error(f"Word の処理に失敗しました: {_e2}")
+                finally:
+                    try:
+                        import os as _os
+                        _os.remove(_tmp_path)
+                        try:
+                            _os.remove(out_md_path)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+        # Manual retry: try extracting JSON from the last LLM output if earlier automatic extraction failed
+        if st.button("再抽出: 最後のLLM出力から JSON を抽出して sources_word に保存", key="force_extract_word"):
+            last_out = st.session_state.global_kv.get("last_llm_out")
+            if not last_out:
+                st.warning("last_llm_out が見つかりません。まず Word を再アップロードして自動処理を実行してください。")
+            else:
+                import json as _json
+                import re as _re
+
+                def _extract_first_json(s: str):
+                    if not s:
+                        return None
+                    m = _re.search(r"(\{[\s\S]*?\})", s)
+                    if m:
+                        return m.group(1)
+                    m = _re.search(r"(\[[\s\S]*?\])", s)
+                    if m:
+                        return m.group(1)
+                    return None
+
+                parsed = None
+                try:
+                    parsed = _json.loads(last_out)
+                except Exception:
+                    # try json code fence
+                    m = _re.search(r"```json\s*([\s\S]*?)```", last_out, _re.IGNORECASE)
+                    js = None
+                    if m:
+                        js = m.group(1).strip()
+                    if not js:
+                        m2 = _re.search(r"```[\s\S]*?```", last_out)
+                        if m2:
+                            inner = m2.group(0).strip('`').strip()
+                            js = inner
+                    if not js:
+                        js = _extract_first_json(last_out)
+                    if js:
+                        try:
+                            parsed = _json.loads(js)
+                        except Exception:
+                            parsed = None
+
+                if parsed is not None:
+                    val = parsed
+                    if isinstance(val, dict):
+                        val = [val]
+                    try:
+                        meta = {"title": st.session_state.global_kv.get("sources_word", [{}])[0].get("title", "uploaded.docx"),
+                                "url": f"uploaded://{meta['title']}" if False else f"uploaded://{val[0].get('title', 'uploaded.docx')}",
+                                "note": "Recovered from last LLM output"}
+                    except Exception:
+                        meta = {"title": "uploaded.docx", "url": "uploaded://uploaded.docx", "note": "Recovered from last LLM output"}
+                    try:
+                        if not any(isinstance(it, dict) and it.get("title") == meta["title"] for it in val):
+                            val.insert(0, meta)
+                    except Exception:
+                        pass
+                    st.session_state.global_kv["sources_word"] = val
+                    st.success("再抽出に成功しました: sources_word を更新しました")
+                else:
+                    st.error("再抽出に失敗しました: LLM出力から JSON を抽出できませんでした。")
+
         cols = st.columns([1,1])
         with cols[0]:
             st.subheader("sources_slack (JSON array or plain lines)")
@@ -2389,7 +2757,34 @@ def render_detail():
     with tb2:
         st.write(f"Step {r+1} / 列 {c+1}")
     with tb3:
-        pass
+        # Quick actions: add/remove agent, add row
+        if st.button("このエージェントを削除", key=f"detail_remove_{agent.id}"):
+            try:
+                # remove agent from its row
+                st.session_state.grid[r].pop(c)
+                # if row becomes empty, remove the row
+                if len(st.session_state.grid[r]) == 0:
+                    st.session_state.grid.pop(r)
+                    # ensure current_row remains valid
+                    st.session_state.current_row = min(st.session_state.current_row, max(0, len(st.session_state.grid)-1))
+                st.success("エージェントを削除しました")
+                go_main()
+            except Exception as _e:
+                st.error(f"削除に失敗しました: {_e}")
+        if st.button("この列の右にエージェントを追加", key=f"detail_addright_{agent.id}"):
+            try:
+                st.session_state.grid[r].insert(c+1, new_agent(f"Agent {len(st.session_state.grid[r])+1}"))
+                st.success("エージェントを追加しました")
+                safe_rerun()
+            except Exception as _e:
+                st.error(f"追加に失敗しました: {_e}")
+        if st.button("この行の下に新規行を追加", key=f"detail_addrow_{agent.id}"):
+            try:
+                st.session_state.grid.insert(r+1, [new_agent("Agent 1")])
+                st.success("行を追加しました")
+                safe_rerun()
+            except Exception as _e:
+                st.error(f"行の追加に失敗しました: {_e}")
 
     agent.enabled = st.checkbox("有効", value=agent.enabled, key=f"detail_enabled_{agent.id}")
     agent.name = st.text_input("名前", value=agent.name, key=f"detail_name_{agent.id}")
