@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import json
 import os
 import uuid
@@ -26,16 +27,84 @@ try:
 except Exception:
     pypandoc = None
 
+# Web 取り込み用（存在しなければフォールバック）
+try:
+    import requests
+except Exception:
+    requests = None
+
+try:
+    import trafilatura
+except Exception:
+    trafilatura = None
+
+try:
+    from readability import Document as ReadabilityDocument
+except Exception:
+    ReadabilityDocument = None
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
+
+try:
+    import html2text as _h2t
+except Exception:
+    _h2t = None
+
 
 # ============ スタイル/CSS ============
 st.markdown("""
 <style>
-.agent-card {padding:10px; border-radius:10px; background: #f6fbff; border:1px solid #d0e7ff; margin-bottom:8px}
-.agent-title {font-weight:700; margin-bottom:6px}
-.agent-actions {margin-top:6px}
-.agent-actions > div > button {padding:0.15rem 0.3rem; font-size:0.9rem}
-.step-toolbar button {padding:0.2rem 0.4rem; font-size:0.9rem}
-.small-btn button {padding:0.15rem 0.3rem; font-size:0.9rem}
+/* トップバー（薄いカプセル） */
+.agent-topbar{
+  display:flex; align-items:center; justify-content:space-between; gap:8px;
+  padding:6px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(120,140,180,.25);
+  background: rgba(80,120,200,.06);
+}
+[data-theme="dark"] .agent-topbar{
+  border-color: rgba(120,160,220,.15);
+  background: rgba(80,140,240,.08);
+}
+.agent-topbar.is-current{
+  background: rgba(90,140,240,.12);
+  border-color: rgba(120,160,240,.28);
+}
+
+/* タイトルと小チップ */
+.agent-title{ display:flex; align-items:center; gap:8px; font-weight:700; letter-spacing:.2px; }
+.agent-chip{
+  font-size: 11px; padding: 2px 8px; border-radius:999px;
+  background: rgba(90,140,240,.18); color:#2e6fed; border:1px solid rgba(90,140,240,.35);
+}
+[data-theme="dark"] .agent-chip{ color:#9cc0ff; }
+
+/* 現在行用の控えめチップ */
+.agent-badge-current{
+  font-size: 11px; padding:2px 8px; border-radius:999px;
+  background: rgba(90,140,240,.14); color:#2e6fed; border:1px solid rgba(90,140,240,.28);
+}
+
+/* ミニボタン行 */
+.btn-row{ display:grid; grid-template-columns: repeat(4, 1fr); gap:6px; margin-top:6px; }
+.small-btn button{ padding:.2rem .35rem !important; font-size:.9rem !important; border-radius:10px !important; }
+
+/* メタ行（ID） */
+.enabled-line{ display:flex; align-items:center; gap:8px; margin-top:4px; }
+.enabled-badge{
+  font-size: 11px; padding: 2px 8px; border-radius:999px; border:1px solid rgba(128,140,160,.35);
+  background: rgba(150,170,200,.12);
+}
+[data-theme="dark"] .enabled-badge{ border-color: rgba(120,140,180,.35); background: rgba(120,140,180,.12); }
+
+/* Expander を軽くカード風 */
+[data-testid="stExpander"]{ border-radius:12px; border:1px solid rgba(128,128,128,.25); }
+
+/* 行操作ボタンを少し詰める */
+.step-toolbar button { padding:0.2rem 0.4rem; font-size:0.9rem }
 </style>
 """, unsafe_allow_html=True)
 
@@ -115,6 +184,42 @@ SCHEMA_ENFORCER = (
 )
 
 
+# ============ Markdown 目次生成 ============
+def compute_doc_index(md: str) -> Dict[str, Any]:
+    if not isinstance(md, str):
+        md = str(md or "")
+    lines = md.splitlines()
+    flat = []
+    stack = []
+    toc = {"title": "ROOT", "children": []}
+    stack.append((0, toc))
+    anchor_counts: Dict[str, int] = {}
+
+    def slugify(title: str) -> str:
+        t = re.sub(r"[^\w\-一-龠ぁ-んァ-ンー]+", "-", title.strip()).strip("-").lower()
+        if not t:
+            t = "section"
+        cnt = anchor_counts.get(t, 0) + 1
+        anchor_counts[t] = cnt
+        return t if cnt == 1 else f"{t}-{cnt}"
+
+    for ln in lines:
+        m = re.match(r"^(#{1,6})\s+(.+?)\s*$", ln)
+        if not m:
+            continue
+        level = len(m.group(1))
+        title = m.group(2).strip()
+        anchor = slugify(title)
+        node = {"title": title, "level": level, "anchor": anchor, "children": []}
+        flat.append({"level": level, "title": title, "anchor": anchor})
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        parent_level, parent_node = stack[-1]
+        parent_node["children"].append(node)
+        stack.append((level, node))
+    return {"flat": flat, "toc": toc}
+
+
 # ============ マクロ展開ユーティリティ ============
 def _to_int_or_none(s: str) -> Optional[int]:
     try:
@@ -134,11 +239,8 @@ def deep_get(obj: Any, path: str) -> Any:
                 cur = cur[part]
             else:
                 i = _to_int_or_none(part)
-                if i is not None:
-                    if str(i) in cur:
-                        cur = cur[str(i)]
-                    else:
-                        return None
+                if i is not None and str(i) in cur:
+                    cur = cur[str(i)]
                 else:
                     return None
         elif isinstance(cur, list):
@@ -195,27 +297,6 @@ def find_judge_results(ctx: Dict[str, Any]) -> Any:
         return None
     return results[0] if len(results) == 1 else results
 
-def find_latest_kvpatch_target_doc(ctx: Dict[str, Any]) -> Optional[str]:
-    resp = (ctx or {}).get("resp") or {}
-    if not isinstance(resp, dict):
-        return None
-    keys = []
-    for k in resp.keys():
-        try:
-            keys.append(int(k))
-        except Exception:
-            pass
-    keys = sorted([k for k in keys if k < 0], reverse=True)
-    for k in keys:
-        cells = resp.get(str(k)) or []
-        for cell in cells:
-            msg = cell.get("message") or {}
-            if isinstance(msg, dict):
-                kvp = msg.get("kv_patch") or {}
-                if isinstance(kvp, dict) and isinstance(kvp.get("target_doc"), str):
-                    return kvp.get("target_doc")
-    return None
-
 def _get_prev_first_response(ctx: Dict[str, Any]) -> Any:
     cells = _get_prev_row_cells(ctx)
     if not cells:
@@ -266,51 +347,32 @@ def expand_prompt_macros(prompt: str, ctx: Dict[str, Any], row_idx: Optional[int
         return f"(PrevStep.Agent:{agent_id} not found)"
 
     def _repl_prev_all(_m):
-        arr = summarize_prev_row(ctx)
-        return json_pretty(arr)
+        return json_pretty(summarize_prev_row(ctx))
 
     def _repl_target_doc(_m):
         v = deep_get(ctx, "global_kv.target_doc")
-        if v is None:
-            return ""
-        return v if isinstance(v, str) else json_pretty(v)
-
-    def _repl_kvpatch_target_doc(_m):
-        v = find_latest_kvpatch_target_doc(ctx)
-        if isinstance(v, str) and v:
-            return v
-        gv = deep_get(ctx, "global_kv.target_doc")
-        return gv if isinstance(gv, str) else (json_pretty(gv) if gv is not None else "")
+        return v if isinstance(v, str) else (json_pretty(v) if v is not None else "")
 
     def _repl_judge(_m):
         v = find_judge_results(ctx)
-        if v is None:
-            return "(JudgeResult not found)"
-        return json_pretty(v) if isinstance(v, (dict, list)) else str(v)
+        return json_pretty(v) if isinstance(v, (dict, list)) else (v or "(JudgeResult not found)")
 
     def _repl_prev_first_prompt(_m):
         txt = _get_prev_first_prompt_text(row_idx or 0)
-        if not txt:
-            return "(PrevStep.First.Prompt not found)"
-        return txt
+        return txt or "(PrevStep.First.Prompt not found)"
 
     def _repl_prev_first_resp(_m):
         v = _get_prev_first_response(ctx)
-        if v is None:
-            return "(PrevStep.First.Response not found)"
-        return json_pretty(v) if isinstance(v, (dict, list)) else str(v)
+        return json_pretty(v) if isinstance(v, (dict, list)) else (v or "(PrevStep.First.Response not found)")
 
     def _repl_context_path(m):
         path = normalize_context_path(m.group(1))
         v = deep_get(ctx, path)
-        if v is None:
-            return f"(not found: Context.{path})"
-        return json_pretty(v) if isinstance(v, (dict, list)) else str(v)
+        return json_pretty(v) if isinstance(v, (dict, list)) else (v if v is not None else f"(not found: Context.{path})")
 
     s = re.sub(r"\{PrevStep\.Agent:([A-Za-z0-9\-]+)\}", _repl_prev_agent, s)
     s = re.sub(r"\{PrevStep\.All\}", _repl_prev_all, s)
     s = re.sub(r"\{TargetDoc\}", _repl_target_doc, s)
-    s = re.sub(r"\{KVPatch\.target_doc\}", _repl_kvpatch_target_doc, s)
     s = re.sub(r"\{JudgeResult\}", _repl_judge, s)
     s = re.sub(r"\{PrevStep\.First\.Prompt\}", _repl_prev_first_prompt, s)
     s = re.sub(r"\{PrevStep\.First\.Response\}", _repl_prev_first_resp, s)
@@ -318,6 +380,7 @@ def expand_prompt_macros(prompt: str, ctx: Dict[str, Any], row_idx: Optional[int
     return s
 
 
+# ============ OpenAI ============
 def get_openai_api_key() -> str:
     key = st.session_state.get("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY") or os.environ.get("LLM_API_KEY")
     if not key:
@@ -351,11 +414,9 @@ def call_llm(messages: List[Dict[str, str]], model: str, temperature: float, max
     import openai
     key = get_openai_api_key()
     os.environ.setdefault("OPENAI_API_KEY", key)
-
     params = {"model": model, "temperature": float(temperature), "max_tokens": int(max_tokens)}
     if seed is not None:
         params["seed"] = int(seed)
-
     last_exc = None
     OpenAIClient = getattr(openai, "OpenAI", None)
     if OpenAIClient:
@@ -387,9 +448,7 @@ def call_llm(messages: List[Dict[str, str]], model: str, temperature: float, max
                                 content = msg.get("content")
                             else:
                                 content = choice.get("text") or choice.get("content")
-                        if content is None:
-                            return str(resp)
-                        return str(content)
+                        return str(content) if content is not None else str(resp)
                     except Exception as e:
                         last_exc = e
             except Exception as e:
@@ -425,7 +484,7 @@ class Agent:
     seed: Optional[int] = None
     enabled: bool = True
 
-    history: List[Dict[str, str]] = field(default_factory=list)  # user/assistant のみ保持（systemは保持しない）
+    history: List[Dict[str, str]] = field(default_factory=list)
     last_raw: str = ""
     last_json: Any = None
 
@@ -438,7 +497,7 @@ def ensure_state():
     if "OPENAI_API_KEY" not in st.session_state:
         st.session_state.OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
     if "grid" not in st.session_state:
-        st.session_state.grid = [[new_agent("Agent 1")]]
+        st.session_state.grid = [[new_agent("Ingestor"), new_agent("Editor"), new_agent("Completer"), new_agent("Optimizer")]]
     if "current_row" not in st.session_state:
         st.session_state.current_row = 0
     if "loop_index" not in st.session_state:
@@ -450,13 +509,44 @@ def ensure_state():
     if "view" not in st.session_state:
         st.session_state.view = "main"
     if "global_kv" not in st.session_state:
+        base_doc = (
+            "# タイトル\n\n"
+            "## 概要\n\n(ここに概要)\n\n"
+            "## 前提条件\n\n- \n\n"
+            "## 環境セットアップ\n\n- \n\n"
+            "## 手順\n\n"
+            "### ステップ1\n\n(やること)\n\n"
+            "### ステップ2\n\n(やること)\n\n"
+            "### ステップ3\n\n(やること)\n\n"
+            "## よくあるエラーと対処\n\n"
+            "- 症状: \n  - 原因: \n  - 対処: \n\n"
+            "## ベストプラクティス\n\n- \n\n"
+            "## 次のステップ\n\n- \n\n"
+            "## 参考資料\n\n- \n\n"
+            "## 付録\n\n- \n"
+        )
+        desired_outline_default = [
+            "# タイトル",
+            "概要",
+            "前提条件",
+            "環境セットアップ",
+            "手順",
+            "よくあるエラーと対処",
+            "ベストプラクティス",
+            "次のステップ",
+            "参考資料",
+            "付録",
+        ]
         st.session_state.global_kv = {
             "doc_title": "ターゲット文書",
-            "target_doc": "# タイトル\n\n(ここに本文が入ります)\n",
+            "target_doc": base_doc,
+            "doc_index": compute_doc_index(base_doc),
             "sources_word": [],
             "sources_excel": [],
             "sources_csv": [],
             "sources_text": [],
+            "sources_web": [],
+            "desired_outline": desired_outline_default,
         }
     if "defaults" not in st.session_state:
         st.session_state.defaults = {
@@ -466,6 +556,11 @@ def ensure_state():
             "seed": None,
             "columns_per_row": 3,
         }
+    if "ui_target_agent_id" not in st.session_state:
+        st.session_state.ui_target_agent_id = None
+    # 非表示にするエージェントID（指定があれば）
+    if "hidden_agent_ids" not in st.session_state:
+        st.session_state.hidden_agent_ids = ["26bd9a2b"]  # 指定があればここに列挙
 
 ensure_state()
 
@@ -478,7 +573,6 @@ def build_indexed_response_current(row_idx: int) -> Dict[str, List[Dict[str, Any
         row = st.session_state.grid[abs_row]
         cells: List[Dict[str, Any]] = []
         for c, agent in enumerate(row):
-            # 最後の「純粋なユーザー指示」を履歴から取得（systemは履歴に入れていない）
             last_user = None
             try:
                 for h in reversed(agent.history):
@@ -489,21 +583,19 @@ def build_indexed_response_current(row_idx: int) -> Dict[str, List[Dict[str, Any
                 last_user = None
             cells.append({
                 "message": agent.last_json,
-                "raw": agent.last_raw or None,  # 純粋なレスポンス
+                "raw": agent.last_raw or None,
                 "agent_id": agent.id,
                 "name": agent.name,
                 "row": abs_row,
                 "col": c,
-                "prompt": last_user,            # 純粋なユーザープロンプト
+                "prompt": last_user,
             })
         mapping[str(rel)] = cells
     return mapping
 
 def build_context_for_row(row_idx: int) -> Dict[str, Any]:
     resp_cur = build_indexed_response_current(row_idx)
-    # Prompt マップ
     prompt_map: Dict[str, List[Optional[str]]] = {}
-    # 純粋なレスポンス（raw）のマップ
     resp_only_map: Dict[str, List[Optional[str]]] = {}
     for k, cells in (resp_cur or {}).items():
         if isinstance(cells, list):
@@ -512,20 +604,19 @@ def build_context_for_row(row_idx: int) -> Dict[str, Any]:
         else:
             prompt_map[k] = []
             resp_only_map[k] = []
-
     return {
         "loop_index": st.session_state.loop_index,
         "current_row": row_idx,
-        "response": {"0": resp_cur},  # 後方互換
+        "response": {"0": resp_cur},
         "resp": resp_cur,
-        "Prompt": prompt_map,         # 純粋なユーザープロンプト
-        "RespOnly": resp_only_map,    # 純粋なレスポンス（生）
-        "System": SCHEMA_ENFORCER,    # システムプロンプト（参照用、編集不可）
+        "Prompt": prompt_map,
+        "RespOnly": resp_only_map,
+        "System": SCHEMA_ENFORCER,
         "global_kv": st.session_state.global_kv,
     }
 
 
-# ============ ワークフロー保存/読込 ============
+# ============ Workflow 保存/読込 ============
 def serialize_workflow() -> str:
     grid_dump: List[List[Dict[str, Any]]] = []
     for row in st.session_state.grid:
@@ -541,9 +632,10 @@ def serialize_workflow() -> str:
                 "seed": ag.seed,
                 "enabled": ag.enabled,
             })
+        row_dump.append
         grid_dump.append(row_dump)
     data = {
-        "version": 1,
+        "version": 2,
         "defaults": st.session_state.defaults,
         "global_kv": st.session_state.global_kv,
         "grid": grid_dump,
@@ -595,11 +687,8 @@ def run_agent(agent: Agent, row_idx: int) -> Agent:
     ctx = build_context_for_row(row_idx)
     expanded_instr = expand_prompt_macros(agent.user_prompt or "", ctx, row_idx=row_idx)
 
-    # システムプロンプトは system ロールで付与し、履歴には入れない
-    system_prompt = SCHEMA_ENFORCER
-    user_prompt_content = expanded_instr
+    messages = [{"role": "system", "content": SCHEMA_ENFORCER}] + agent.history[-20:] + [{"role": "user", "content": expanded_instr}]
 
-    messages = [{"role": "system", "content": system_prompt}] + agent.history[-20:] + [{"role": "user", "content": user_prompt_content}]
     model = agent.model or st.session_state.defaults["model"]
     temperature = agent.temperature if agent.temperature is not None else st.session_state.defaults["temperature"]
     max_tokens = int(agent.max_tokens or st.session_state.defaults["max_tokens"])
@@ -621,8 +710,7 @@ def run_agent(agent: Agent, row_idx: int) -> Agent:
     except Exception:
         pass
 
-    # 履歴（user は純粋なユーザープロンプトのみ記録、systemは記録しない）
-    agent.history.append({"role": "user", "content": user_prompt_content})
+    agent.history.append({"role": "user", "content": expanded_instr})
     agent.history.append({"role": "assistant", "content": raw})
     agent.history = agent.history[-40:]
 
@@ -659,7 +747,9 @@ def _apply_prompt_patch(prompt_patch: Dict[str, Any], current_row: int):
             ag.user_prompt = new_prompt
             st.session_state.grid[tgt_row][cidx] = ag
             try:
-                st.session_state[f"det_prompt_{ag.id}"] = new_prompt
+                pk = f"det_prompt_{ag.id}_pending"
+                st.session_state[pk] = new_prompt
+                safe_rerun()
             except Exception:
                 pass
 
@@ -671,6 +761,10 @@ def _apply_kv_patch(patch: Dict[str, Any]):
             continue
         if k == "target_doc" and isinstance(v, str):
             st.session_state.global_kv["target_doc"] = v
+            try:
+                st.session_state.global_kv["doc_index"] = compute_doc_index(v)
+            except Exception:
+                pass
         else:
             st.session_state.global_kv[k] = v
 
@@ -785,6 +879,11 @@ def run_to_end():
         if st.session_state.current_row == 0 and row_idx == len(st.session_state.grid) - 1:
             break
 
+def run_to_end_times(n: int):
+    n = max(1, int(n or 1))
+    for _ in range(n):
+        run_to_end()
+
 
 # ============ 画面遷移 / 検索 ============
 def go_detail(agent_id: str):
@@ -805,7 +904,7 @@ def find_agent_pos(agent_id: str):
     return None
 
 
-# ============ 取込（Word/Excel/CSV/Text） ============
+# ============ 取込（Word/Excel/CSV/Text/Web） ============
 def read_word_to_markdown(file) -> str:
     tmp_path = None
     out_md_path = None
@@ -938,8 +1037,220 @@ def read_text(file) -> str:
         except Exception as e:
             return f"(テキスト読込失敗: {e})"
 
+def html_to_markdown(html: str) -> str:
+    if not isinstance(html, str):
+        html = str(html or "")
+    if _h2t:
+        conv = _h2t.HTML2Text()
+        conv.ignore_links = False
+        conv.body_width = 0
+        md = conv.handle(html)
+    else:
+        md = re.sub(r"<[^>]+>", "", html)
+    md = re.sub(r"\n{3,}", "\n\n", md).strip()
+    return md
 
-# ============ UI: Sidebar（保存/読込を追加） ============
+def read_web_to_markdown(url: str) -> Dict[str, Any]:
+    """
+    指定URLから本文を抽出してMarkdown文字列を返す
+    返却: { 'ok': bool, 'title': str, 'url': str, 'content_md': str, 'fetched_at': str, 'error': str|None }
+    """
+    from datetime import datetime, timezone
+
+    if not url or not isinstance(url, str):
+        return {"ok": False, "title": "", "url": url, "content_md": "", "fetched_at": "", "error": "invalid_url"}
+
+    title = ""
+    md = ""
+    err = None
+
+    try:
+        # 1) trafilatura を優先
+        if trafilatura is not None:
+            downloaded = trafilatura.fetch_url(url)
+            if downloaded:
+                extracted = trafilatura.extract(
+                    downloaded,
+                    include_formatting=True,
+                    include_links=True,
+                    favor_recall=True,
+                )
+                if extracted:
+                    md = extracted
+                    lines = [ln.strip() for ln in md.splitlines() if ln.strip()]
+                    if lines:
+                        title = lines[0].lstrip("# ").strip()[:80]
+
+        # 2) readability-lxml
+        if not md and (requests is not None) and (ReadabilityDocument is not None):
+            headers = {"User-Agent": "Mozilla/5.0 (compatible; ContentIngestor/1.0; +https://example.com)"}
+            r = requests.get(url, headers=headers, timeout=20)
+            r.raise_for_status()
+            html = r.text
+            doc = ReadabilityDocument(html)
+            title = (doc.short_title() or "").strip()[:80] or title
+            cleaned_html = doc.summary(html_partial=True)
+            md = html_to_markdown(cleaned_html)
+
+        # 3) BeautifulSoup フォールバック
+        if not md and (requests is not None) and (BeautifulSoup is not None):
+            headers = {"User-Agent": "Mozilla/5.0 (compatible; ContentIngestor/1.0; +https://example.com)"}
+            r = requests.get(url, headers=headers, timeout=20)
+            r.raise_for_status()
+            html = r.text
+            soup = BeautifulSoup(html, "html.parser")
+            # ノイズ除去
+            for tag in soup(["script", "style", "noscript", "svg", "canvas", "form", "iframe"]):
+                tag.decompose()
+            for tag in soup.find_all(["header", "footer", "nav", "aside"]):
+                tag.decompose()
+            # タイトル
+            if soup.title and soup.title.string:
+                title = (soup.title.string or "").strip()[:80] or title
+            # 本文候補
+            main = soup.find(["main", "article"]) or soup.body or soup
+            cleaned_html = str(main)
+            md = html_to_markdown(cleaned_html)
+
+        # 軽いノイズ抑制
+        if md:
+            noise_patterns = [
+                r"^この記事をシェア", r"^関連記事", r"^広告", r"^スポンサー", r"^同意します", r"^Cookie",
+            ]
+            lines = md.splitlines()
+            cleaned = []
+            for ln in lines:
+                if any(re.search(pat, ln, re.I) for pat in noise_patterns):
+                    continue
+                cleaned.append(ln)
+            md = "\n".join(cleaned).strip()
+
+        if not md:
+            err = "extract_failed"
+
+    except Exception as e:
+        err = f"{e}"
+
+    return {
+        "ok": bool(md),
+        "title": title or "(no title)",
+        "url": url,
+        "content_md": md or "",
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "error": err,
+    }
+
+
+# ============ UI: Sidebar（保存/読込/設定/取込/実行） ============
+def apply_default_knowledge_flow():
+    st.session_state.grid = [[
+        Agent(id=str(uuid.uuid4())[:8], name="Ingestor", user_prompt=(
+            "あなたは情報インジェスト担当です。\n"
+            "目的:\n"
+            "- 取り込みソース（Word/Excel/CSV/Text/Web）を正規化し、既存の本文に統合します。\n"
+            "- 本文を「チュートリアル向けMarkdownアウトライン」に沿って構成整理します。\n"
+            "入力:\n"
+            "- 本文（現状）: {Context.global_kv.target_doc}\n"
+            "- 取り込み（Word）: {Context.global_kv.sources_word}\n"
+            "- 取り込み（Excel）: {Context.global_kv.sources_excel}\n"
+            "- 取り込み（CSV）: {Context.global_kv.sources_csv}\n"
+            "- 取り込み（Text）: {Context.global_kv.sources_text}\n"
+            "- 取り込み（Web）: {Context.global_kv.sources_web}\n"
+            "- 望ましいアウトライン（任意）: {Context.global_kv.desired_outline}\n"
+            "やること:\n"
+            "- ソースを読み、重複・ノイズを除去して要点をMarkdownに正規化。\n"
+            "- desired_outline が空なら、以下の既定アウトラインで本文を再構成:\n"
+            "  「タイトル/概要/前提条件/環境セットアップ/手順(ステップ1..)/よくあるエラーと対処/ベストプラクティス/次のステップ/参考資料/付録」\n"
+            "- 既存本文の有用部は保持し、必要に応じて節（## 見出し）を新設して統合。\n"
+            "- 根拠は取り込みソースからのみ。不明点は推測せず「TODO: ～を確認」と明示。\n"
+            "- 参考リンクはsources_webからのみ引用（存在する場合）。出典は「参考資料」節に箇条書きで集約。\n"
+            "- 文体は簡潔・手順中心。見出し・箇条書き・コードブロック（必要時）の整形。\n"
+            "- タイトル未設定なら適切に補う。\n"
+            "- token制限内で最重要項目を優先統合。\n"
+            "失敗時の振る舞い:\n"
+            "- 新規の有益情報が無い場合は本文を大きく変更せず、notesに理由を記述。\n"
+            "出力はJSONのみ（前置きやコードブロック禁止）:\n"
+            "{\n"
+            "  \"ok\": true,\n"
+            "  \"message\": {\n"
+            "    \"type\": \"ingest\",\n"
+            "    \"notes\": \"(統合メモ: 何を取り込み、何を据え置いたか。TODOも明記)\",\n"
+            "    \"changes\": [\"(追加/修正した主な見出しや節)\"]\n"
+            "  },\n"
+            "  \"kv_patch\": {\"target_doc\": \"(統合後の本文Markdown全文: チュートリアルアウトラインに準拠)\"},\n"
+            "  \"meta\": {}\n"
+            "}\n"
+        )),
+        Agent(id=str(uuid.uuid4())[:8], name="Editor", user_prompt=(
+            "あなたは本文編集担当です。\n"
+            "目的:\n"
+            "- 本文を読みやすく再編集し、チュートリアル向けMarkdownアウトラインに完全準拠させます。\n"
+            "入力:\n"
+            "- 現在の本文: {Context.global_kv.target_doc}\n"
+            "- 本文インデックス: {Context.global_kv.doc_index}\n"
+            "- 直前STEPの出力: {Context.resp[\"-1\"]}\n"
+            "- 望ましいアウトライン（任意）: {Context.global_kv.desired_outline}\n"
+            "やること:\n"
+            "- desired_outline があればそれに厳密に合わせ、無ければ既定アウトラインに準拠。\n"
+            "- 節構成の重複を解消、見出し粒度を統一、ステップ名を動詞から始まる形に整理。\n"
+            "- 用語を統一、冗長表現や曖昧表現を削減。箇条書き・表・コードブロックを適切に使用。\n"
+            "- 「よくあるエラーと対処」は 症状→原因→対処 の順で最小テンプレに整形。\n"
+            "- 出典やURLは「参考資料」節に集約し、本文中は最小限の参照。\n"
+            "- 重要情報は残し、重複のみ統合・省略。\n"
+            "出力はJSONのみ（前置きやコードブロック禁止）:\n"
+            "{\n"
+            "  \"ok\": true,\n"
+            "  \"message\": {\"type\": \"commit\", \"summary\": \"(変更点の要約: 構成変更、表現統一、重複解消など)\"},\n"
+            "  \"kv_patch\": {\"target_doc\": \"(編集後の本文全体: アウトライン準拠・読みやすさ改善済み)\"},\n"
+            "  \"meta\": {}\n"
+            "}\n"
+        )),
+        Agent(id=str(uuid.uuid4())[:8], name="Completer", user_prompt=(
+            "あなたは構成補完担当です。\n"
+            "目的:\n"
+            "- 抜けている節や記述を検出し、必要最小限の内容を追加して完全性を高めます。\n"
+            "入力:\n"
+            "- 本文インデックス: {Context.global_kv.doc_index}\n"
+            "- 本文: {Context.global_kv.target_doc}\n"
+            "- 望ましいアウトライン（任意）: {Context.global_kv.desired_outline}\n"
+            "やること:\n"
+            "- desired_outline または既定アウトラインと照合し、欠落節を特定。\n"
+            "- 「前提条件」「環境セットアップ」「手順」に必須の抜けがあれば優先補完。\n"
+            "- 補完は最小限かつ実用重視。根拠不明の事項は「TODO: 要確認」を明記。\n"
+            "- 既存記述と重複しないように差分追加。大幅書き換えは避ける。\n"
+            "出力はJSONのみ（前置きやコードブロック禁止）:\n"
+            "{\n"
+            "  \"ok\": true,\n"
+            "  \"message\": {\"type\": \"complete\", \"added\": [\"(追加した見出しや小節)\"], \"notes\": \"(補完方針や未解決TODO)\"},\n"
+            "  \"kv_patch\": {\"target_doc\": \"(補完後の本文全体)\"},\n"
+            "  \"meta\": {}\n"
+            "}\n"
+        )),
+        Agent(id=str(uuid.uuid4())[:8], name="Optimizer", user_prompt=(
+            "あなたはプロンプト改善担当です。\n"
+            "目的:\n"
+            "- 現在行の「左から1番＝Ingestor」のプロンプトを、取り込み漏れ防止・アウトライン徹底・非推測方針の明確化の観点で改善して即時更新します。\n"
+            "入力:\n"
+            "- 直前STEPの左から1番の出力要約: {Context.resp[\"-1\"][0].message}\n"
+            "- グローバル情報（取り込みソース・アウトライン）: {Context.global_kv}\n"
+            "チェック項目:\n"
+            "- sources_word / sources_excel / sources_csv / sources_text / sources_web をすべて参照しているか\n"
+            "- desired_outline を考慮（無い場合は既定アウトラインを明示）\n"
+            "- 本文をチュートリアル向けMarkdownで構成\n"
+            "- 未知はTODO明示・出典集約・token配慮・JSONのみ出力（コードブロック禁止）\n"
+            "出力はJSONのみ（前置きやコードブロック禁止）:\n"
+            "{\n"
+            "  \"ok\": true,\n"
+            "  \"message\": {\"type\": \"prompt_update\", \"before\": \"(現プロンプトの要約や改善観点)\", \"after\": \"(改善後プロンプト全文)\"},\n"
+            "  \"kv_patch\": {\"Prompt\": {\"0\": {\"0\": \"(改善後プロンプト全文)\"}}},\n"
+            "  \"meta\": {}\n"
+            "}\n"
+        )),
+    ]]
+    st.session_state.current_row = 0
+    st.session_state.current_loop_steps = []
+    st.success("デフォルトのナレッジフローを適用しました")
+
 with st.sidebar:
     st.header("設定")
     st.session_state.OPENAI_API_KEY = st.text_input("OPENAI_API_KEY", value=st.session_state.get("OPENAI_API_KEY", ""), type="password")
@@ -955,6 +1266,10 @@ with st.sidebar:
     st.caption(f"Agents: {sum(len(r) for r in st.session_state.grid)}")
 
     st.markdown("---")
+    if st.button("📐 デフォルトフロー適用"):
+        apply_default_knowledge_flow()
+        safe_rerun()
+
     save_json = serialize_workflow()
     st.download_button("💾 保存", data=save_json, file_name="workflow.json", mime="application/json")
     up_flow = st.file_uploader("📂 読込 (JSON)", type=["json"], key="wf_upload")
@@ -966,6 +1281,76 @@ with st.sidebar:
                 safe_rerun()
         except Exception as e:
             st.error(f"読込失敗: {e}")
+
+    st.markdown("---")
+    # ファイル取込（サイドバーに移動）
+    st.subheader("ファイル取込")
+    with st.expander("Word (.docx)"):
+        wfile = st.file_uploader("Word ファイルを選択", type=["docx"], key="up_word")
+        if wfile is not None:
+            md = read_word_to_markdown(wfile)
+            st.text_area("プレビュー（Markdown相当）", value=md, height=160, key="preview_word")
+            if st.button("sources_word に保存", key="save_word"):
+                st.session_state.global_kv["sources_word"] = [{"title": wfile.name, "content_md": md}]
+                st.success("sources_word を更新しました")
+    with st.expander("Excel (.xlsx/.xls/.xlsm)"):
+        efile = st.file_uploader("Excel ファイルを選択", type=["xlsx", "xls", "xlsm"], key="up_excel")
+        if efile is not None:
+            md = read_excel_to_markdown(efile)
+            st.text_area("プレビュー（Markdown/CSV）", value=md, height=160, key="preview_excel")
+            if st.button("sources_excel に保存", key="save_excel"):
+                st.session_state.global_kv["sources_excel"] = [{"title": efile.name, "content_md": md}]
+                st.success("sources_excel を更新しました")
+    with st.expander("CSV (.csv)"):
+        cfile = st.file_uploader("CSV ファイルを選択", type=["csv"], key="up_csv")
+        if cfile is not None:
+            md = read_csv_to_markdown(cfile)
+            st.text_area("プレビュー（Markdown/CSV）", value=md, height=160, key="preview_csv")
+            if st.button("sources_csv に保存", key="save_csv"):
+                st.session_state.global_kv["sources_csv"] = [{"title": getattr(cfile, "name", "data.csv"), "content_md": md}]
+                st.success("sources_csv を更新しました")
+    with st.expander("Text (.txt)"):
+        tfile = st.file_uploader("Text ファイルを選択", type=["txt"], key="up_text")
+        if tfile is not None:
+            tx = read_text(tfile)
+            st.text_area("プレビュー（テキスト）", value=tx, height=160, key="preview_text")
+            if st.button("sources_text に保存", key="save_text"):
+                st.session_state.global_kv["sources_text"] = [{"title": getattr(tfile, "name", "text.txt"), "content": tx}]
+                st.success("sources_text を更新しました")
+    with st.expander("Web (URL)"):
+        url_text = st.text_area("URL（複数可・改行区切り）", value="", height=100, key="up_web_urls")
+        if st.button("取得", key="fetch_web_btn"):
+            urls = [u.strip() for u in (url_text or "").splitlines() if u.strip()]
+            results = []
+            for u in urls:
+                res = read_web_to_markdown(u)
+                results.append(res)
+            st.session_state["web_fetch_results"] = results
+            if results:
+                preview = "\n\n---\n\n".join(
+                    f"# {r.get('title')}\n\nURL: {r.get('url')}\n\n{r.get('content_md')[:2000]}{'... (truncated)' if len(r.get('content_md',''))>2000 else ''}"
+                    for r in results
+                )
+                st.text_area("プレビュー（Markdown）", value=preview, height=200, key="preview_web")
+        if st.button("sources_web に保存", key="save_web_btn"):
+            results = st.session_state.get("web_fetch_results") or []
+            items = [
+                {"title": r.get("title"), "url": r.get("url"), "content_md": r.get("content_md"), "fetched_at": r.get("fetched_at")}
+                for r in results if r.get("ok") and r.get("content_md")
+            ]
+            st.session_state.global_kv["sources_web"] = items
+            st.success(f"sources_web を更新しました（{len(items)}件）")
+
+    st.markdown("---")
+    # 実行操作（サイドバーに移動）
+    st.subheader("実行")
+    if st.button("▶ Step 実行（現在行）"):
+        run_one_step()
+        st.success("Step 実行完了")
+    times = st.number_input("最後まで実行 回数", min_value=1, max_value=100, value=1, step=1)
+    if st.button("⏩ 最後まで実行（指定回数）"):
+        run_to_end_times(times)
+        st.success(f"{int(times)} 回実行完了")
 
     st.markdown("---")
     if st.button("履歴のみ初期化（Grid保持）"):
@@ -987,67 +1372,28 @@ with st.sidebar:
         safe_rerun()
 
 
+# ============ ヘルパー（表示抑制: Completerなど） ============
+def is_agent_hidden(ag: Agent) -> bool:
+    if ag is None:
+        return False
+    # 指定IDで非表示
+    if ag.id in set(st.session_state.get("hidden_agent_ids", [])):
+        return True
+    nm = (ag.name or "").strip().lower()
+    # Completer/Complete 系は表示を隠す（枠も不要）
+    if nm.startswith("completer") or nm.startswith("complete"):
+        return True
+    return False
+
+
 # ============ UI: Main ============
 def render_main():
-    st.title("シンプル・マルチエージェント（ワークフロー制御）")
+    st.title("ワークフロー")
 
-    st.subheader("ターゲット文書")
-    td = st.session_state.global_kv.get("target_doc", "")
-    td_new = st.text_area("target_doc", value=td, height=180)
-    if st.button("target_doc を保存"):
-        st.session_state.global_kv["target_doc"] = td_new
-        st.success("更新しました")
-
-    st.markdown("---")
-    st.subheader("ファイル取込（Word / Excel / CSV / Text）")
-    col1, col2 = st.columns(2)
-    with col1:
-        wfile = st.file_uploader("Word (.docx)", type=["docx"], key="up_word")
-        if wfile is not None:
-            md = read_word_to_markdown(wfile)
-            st.text_area("プレビュー（Markdown相当）", value=md, height=200)
-            if st.button("sources_word に保存", key="save_word"):
-                st.session_state.global_kv["sources_word"] = [{"title": wfile.name, "content_md": md}]
-                st.success("sources_word を更新しました")
-        efile = st.file_uploader("Excel (.xlsx/.xls/.xlsm)", type=["xlsx", "xls", "xlsm"], key="up_excel")
-        if efile is not None:
-            md = read_excel_to_markdown(efile)
-            st.text_area("プレビュー（Markdown/CSV）", value=md, height=200)
-            if st.button("sources_excel に保存", key="save_excel"):
-                st.session_state.global_kv["sources_excel"] = [{"title": efile.name, "content_md": md}]
-                st.success("sources_excel を更新しました")
-    with col2:
-        cfile = st.file_uploader("CSV (.csv)", type=["csv"], key="up_csv")
-        if cfile is not None:
-            md = read_csv_to_markdown(cfile)
-            st.text_area("プレビュー（Markdown/CSV）", value=md, height=200)
-            if st.button("sources_csv に保存", key="save_csv"):
-                st.session_state.global_kv["sources_csv"] = [{"title": cfile.name, "content_md": md}]
-                st.success("sources_csv を更新しました")
-        tfile = st.file_uploader("Text (.txt)", type=["txt"], key="up_text")
-        if tfile is not None:
-            tx = read_text(tfile)
-            st.text_area("プレビュー（テキスト）", value=tx, height=200)
-            if st.button("sources_text に保存", key="save_text"):
-                st.session_state.global_kv["sources_text"] = [{"title": tfile.name, "content": tx}]
-                st.success("sources_text を更新しました")
-
-    st.markdown("---")
-    a, b, _ = st.columns([1, 1, 2])
-    with a:
-        if st.button("Step 実行（現在行）"):
-            run_one_step()
-            st.success("Step 実行")
-    with b:
-        if st.button("最後まで実行（1ループ）"):
-            run_to_end()
-            st.success("完了")
-
-    st.markdown("---")
     base_cols = int(st.session_state.defaults["columns_per_row"])
     for r, row in enumerate(st.session_state.grid):
         st.subheader(f"Step {r+1}")
-        tb1, tb2, tb3 = st.columns([1,1,6], gap="small")
+        tb1, tb2, _tb3 = st.columns([1,1,6], gap="small")
         with tb1:
             if st.button("⬆️ 行上", key=f"add_row_up_{r}"):
                 st.session_state.grid.insert(r, [new_agent("Agent 1")])
@@ -1057,24 +1403,48 @@ def render_main():
                 st.session_state.grid.insert(r+1, [new_agent("Agent 1")])
                 safe_rerun()
 
-        grid_cols = max(base_cols, len(row))
+        # 可視エージェントのみ表示（Completer等は非表示）
+        visible_row = [ag for ag in row if not is_agent_hidden(ag)]
+        grid_cols = max(base_cols, len(visible_row))
         cols = st.columns(grid_cols)
-        for c in range(grid_cols):
-            with cols[c]:
-                if c < len(row):
-                    ag = row[c]
-                    st.markdown('<div class="agent-card">', unsafe_allow_html=True)
-                    st.markdown(f'<div class="agent-title">{ag.name}</div>', unsafe_allow_html=True)
 
+        for c, ag in enumerate(visible_row):
+            with cols[c]:
+                is_current = (r == st.session_state.current_row)
+
+                # カード（非表示対象はここまでで除外済み）
+                card = st.container(border=True)
+                with card:
+                    # ヘッダー
+                    bar_cls = "agent-topbar is-current" if is_current else "agent-topbar"
+                    st.markdown(
+                        f'<div class="{bar_cls}">'
+                        f'  <div class="agent-title"><span class="agent-chip">S{r+1}-C{c+1}</span>{ag.name}</div>'
+                        f'  <div style="display:flex; align-items:center; gap:8px;">'
+                        f'    {"<span class=\'agent-badge-current\'>Current</span>" if is_current else ""}'
+                        f'    <span style="font-size:12px; opacity:.8;">{ag.model}</span>'
+                        f'  </div>'
+                        f'</div>',
+                        unsafe_allow_html=True
+                    )
+
+                    # 有効切替
                     en = st.checkbox("有効", value=ag.enabled, key=f"en_{ag.id}")
                     if en != ag.enabled:
                         ag.enabled = en
-                        st.session_state.grid[r][c] = ag
+                        # grid 内のオリジナル参照を更新（行内の該当IDを探す）
+                        for idx, orig in enumerate(st.session_state.grid[r]):
+                            if orig.id == ag.id:
+                                st.session_state.grid[r][idx] = ag
+                                break
 
-                    # 下配置の小型アイコン操作 ▶＋－🔎
-                    act_cols = st.columns(4, gap="small")
-                    with act_cols[0]:
-                        if st.button("▶", key=f"run_{ag.id}"):
+                    # メタ（Agent ID） はメイン画面から非表示
+
+                    # ボタン行（主要ボタンのみ）
+                    st.markdown('<div class="btn-row small-btn">', unsafe_allow_html=True)
+                    bcols = st.columns(3, gap="small")
+                    with bcols[0]:
+                        if st.button("▶", key=f"run_{ag.id}", help="実行"):
                             updated = run_agent(ag, r)
                             if isinstance(updated.last_json, dict):
                                 patch = updated.last_json.get("kv_patch") or {}
@@ -1088,21 +1458,28 @@ def render_main():
                                         updated.last_json.setdefault("kv_patch", {})["Prompt"] = {}
                                 except Exception:
                                     pass
-                            st.session_state.grid[r][c] = updated
-                    with act_cols[1]:
-                        if st.button("＋", key=f"add_right_{ag.id}"):
-                            st.session_state.grid[r].insert(c+1, new_agent(f"Agent {len(st.session_state.grid[r])+1}"))
-                            safe_rerun()
-                    with act_cols[2]:
-                        if st.button("－", key=f"del_{ag.id}"):
-                            st.session_state.grid[r].pop(c)
+                            # grid 内のオリジナル参照を更新
+                            for idx, orig in enumerate(st.session_state.grid[r]):
+                                if orig.id == ag.id:
+                                    st.session_state.grid[r][idx] = updated
+                                    break
+                    # '＋' ボタンはメイン画面から削除
+                    with bcols[1]:
+                        if st.button("－", key=f"del_{ag.id}", help="削除"):
+                            # グリッド上の実位置を探して削除
+                            for idx, orig in enumerate(st.session_state.grid[r]):
+                                if orig.id == ag.id:
+                                    st.session_state.grid[r].pop(idx)
+                                    break
                             if not st.session_state.grid[r]:
                                 st.session_state.grid.pop(r)
                             safe_rerun()
-                    with act_cols[3]:
-                        if st.button("🔎", key=f"detail_{ag.id}"):
+                    with bcols[2]:
+                        if st.button("🔎", key=f"detail_{ag.id}", help="詳細"):
                             go_detail(ag.id)
+                    st.markdown('</div>', unsafe_allow_html=True)
 
+                    # 出力（Completerなどは非表示にしているためここは他エージェントのみ）
                     with st.expander("Parsed", expanded=False):
                         if ag.last_json:
                             st.code(json_pretty(ag.last_json.get("message")), language="json")
@@ -1114,11 +1491,22 @@ def render_main():
                         else:
                             st.info("(no raw)")
 
-                    st.markdown("</div>", unsafe_allow_html=True)
-
         if st.button("＋追加", key=f"add_tail_{r}"):
             st.session_state.grid[r].append(new_agent(f"Agent {len(st.session_state.grid[r])+1}"))
             safe_rerun()
+
+    st.markdown("---")
+
+    # ターゲット文書（Markdown）と目次をエージェントの下側に移動
+    st.subheader("ターゲット文書（Markdown）")
+    td = st.session_state.global_kv.get("target_doc", "")
+    td_new = st.text_area("target_doc", value=td, height=200)
+    if st.button("target_doc を保存"):
+        st.session_state.global_kv["target_doc"] = td_new
+        st.session_state.global_kv["doc_index"] = compute_doc_index(td_new)
+        st.success("更新しました（目次再生成済）")
+    with st.expander("目次（自動生成）", expanded=False):
+        st.code(json_pretty(st.session_state.global_kv.get("doc_index")), language="json")
 
     st.markdown("---")
     st.subheader("現在ループの進捗")
@@ -1158,8 +1546,28 @@ def render_detail():
     ag.name = st.text_input("名前", value=ag.name, key=f"det_name_{ag.id}")
 
     k = f"det_prompt_{ag.id}"
-    if k not in st.session_state:
+    pending_key = f"{k}_pending"
+    # If a pending update exists (from a button click), apply it before creating the widget
+    if pending_key in st.session_state:
+        try:
+            pending_val = st.session_state.pop(pending_key)
+            # If the widget key already exists, avoid direct assignment (Streamlit forbids it).
+            if k in st.session_state:
+                # update agent object and grid so next render picks it up
+                ag.user_prompt = pending_val
+                st.session_state.grid[r][c] = ag
+                safe_rerun()
+            else:
+                st.session_state[k] = pending_val
+        except Exception:
+            pass
+    # Ensure the session_state prompt reflects the agent's prompt before widget creation
+    if st.session_state.get(k, None) != (ag.user_prompt or ""):
         st.session_state[k] = ag.user_prompt or ""
+
+    # 指示プロンプト（ユーザー）を大きくして戻るボタンの下側に配置
+    ag.user_prompt = st.text_area("指示プロンプト（ユーザー）", key=k, height=480)
+    ag.user_prompt = st.session_state.get(k, "")
 
     with st.expander("モデル設定", expanded=False):
         ag.model = st.text_input("model", value=ag.model, key=f"det_model_{ag.id}")
@@ -1171,26 +1579,34 @@ def render_detail():
         else:
             ag.seed = None
 
-    # テンプレ（仕様に合わせた分かりやすい例）
     t_worker = (
         "あなたはプロンプト改善担当です。\n"
-        "- 直前STEPの左から1番のプロンプト: {Context.Prompt[\"-1\"][0]}\n"
-        "- 直前STEPの左から1番の出力要約: {Context.resp[\"-1\"][0].message}\n\n"
-        "直前のプロンプトを改善し、即時に更新します。\n"
-        "出力は次のJSONのみで返し、kv_patch.Prompt に更新後プロンプトを指定してください:\n"
+        "目的:\n"
+        "- 現在行の「左から1番＝Ingestor」のプロンプトを、取り込み漏れ防止・アウトライン徹底・非推測方針の明確化の観点で改善して即時更新します。\n"
+        "入力:\n"
+        "- 直前STEPの左から1番の出力要約: {Context.resp[\"-1\"][0].message}\n"
+        "- グローバル情報（取り込みソース・アウトライン）: {Context.global_kv}\n\n"
+        "チェック項目:\n"
+        "- sources_word / sources_excel / sources_csv / sources_text / sources_web をすべて参照しているか\n"
+        "- desired_outline を考慮（無い場合は既定アウトラインを明示）\n"
+        "- 本文をチュートリアル向けMarkdownで構成\n"
+        "- 未知はTODO明示・出典集約・token配慮・JSONのみ出力（コードブロック禁止）\n\n"
+        "出力はJSONのみ:\n"
         "{\n"
         "  \"ok\": true,\n"
-        "  \"message\": {\"type\": \"prompt_update\", \"before\": \"(要約)\", \"after\": \"(改善後プロンプト)\"},\n"
-        "  \"kv_patch\": {\"Prompt\": {\"-1\": {\"0\": \"(改善後プロンプト)\"}}},\n"
+        "  \"message\": {\"type\": \"prompt_update\", \"before\": \"(現プロンプトの要約や改善観点)\", \"after\": \"(改善後プロンプト全文)\"},\n"
+        "  \"kv_patch\": {\"Prompt\": {\"0\": {\"0\": \"(改善後プロンプト全文)\"}}},\n"
         "  \"meta\": {}\n"
         "}\n"
     )
+
     t_editor = (
         "あなたは本文編集担当です。\n"
         "- 現在の本文: {Context.global_kv.target_doc}\n"
-        "- 直前STEPの出力: {Context.resp[\"-1\"]}\n\n"
-        "必要な修正を反映した本文の完全版を返してください。\n"
-        "出力は次のJSONのみ:\n"
+        "- 本文インデックス: {Context.global_kv.doc_index}\n"
+        "- 直前STEPの出力: {Context.resp[\"-1\"]}\n"
+        "- 望ましいアウトライン（任意）: {Context.global_kv.desired_outline}\n\n"
+        "不足の節を補い、構成を整え、本文の完全版を返してください。JSONのみ:\n"
         "{\n"
         "  \"ok\": true,\n"
         "  \"message\": {\"type\": \"commit\", \"summary\": \"(変更点の要約)\"},\n"
@@ -1198,25 +1614,30 @@ def render_detail():
         "  \"meta\": {}\n"
         "}\n"
     )
+
     bt1, bt2 = st.columns(2)
     with bt1:
         if st.button("テンプレ: Worker", key=f"tmplW_{ag.id}"):
-            st.session_state[k] = t_worker
+            st.session_state[pending_key] = t_worker
+            safe_rerun()
     with bt2:
         if st.button("テンプレ: Editor", key=f"tmplE_{ag.id}"):
-            st.session_state[k] = t_editor
+            st.session_state[pending_key] = t_editor
+            safe_rerun()
 
-    st.markdown("#### 差し込みショートカット（アイコン＋4文字）")
+    st.markdown("#### 差し込みショートカット")
 
     def insert_at_cursor(snippet: str):
         base = st.session_state.get(k, "")
         if "{|}" in base:
-            st.session_state[k] = base.replace("{|}", snippet, 1)
+            new_val = base.replace("{|}", snippet, 1)
         else:
-            st.session_state[k] = base + ("" if base.endswith("\n") or base == "" else "\n") + snippet
+            new_val = base + ("" if base.endswith("\n") or base == "" else "\n") + snippet
+        # Store pending update and rerun so the pending value is applied before the text_area widget is created.
+        st.session_state[pending_key] = new_val
+        safe_rerun()
 
-    # RowA: global_kv 系
-    rowA = st.columns(5)
+    rowA = st.columns(6)
     with rowA[0]:
         if st.button("📄 TDOC", key=f"ins_tdoc_{ag.id}", use_container_width=True):
             insert_at_cursor("{Context.global_kv.target_doc}")
@@ -1232,32 +1653,31 @@ def render_detail():
     with rowA[4]:
         if st.button("📜 TEXT", key=f"ins_text_{ag.id}", use_container_width=True):
             insert_at_cursor("{Context.global_kv.sources_text}")
+    with rowA[5]:
+        if st.button("🌐 WEB", key=f"ins_web_{ag.id}", use_container_width=True):
+            insert_at_cursor("{Context.global_kv.sources_web}")
 
-    # RowB: resp/Prompt + kv_patch.Prompt
     rowB = st.columns(4)
     with rowB[0]:
+        if st.button("📚 IDX ", key=f"ins_idx_{ag.id}", use_container_width=True):
+            insert_at_cursor("{Context.global_kv.doc_index}")
+    with rowB[1]:
         if st.button("👥 R-1 ", key=f"ins_r_1_{ag.id}", use_container_width=True):
             insert_at_cursor('{Context.resp["-1"]}')
-    with rowB[1]:
+    with rowB[2]:
         if st.button("💬 R1M ", key=f"ins_r1m_{ag.id}", use_container_width=True):
             insert_at_cursor('{Context.resp["-1"][0].message}')
-    with rowB[2]:
-        if st.button("🅿️ P1  ", key=f"ins_p1_{ag.id}", use_container_width=True):
-            insert_at_cursor('{Context.Prompt["-1"][0]}')
     with rowB[3]:
         if st.button("🧠 PRM1", key=f"ins_kvpatch_prompt_prev1_{ag.id}", use_container_width=True):
             insert_at_cursor(
-                '次のJSONで kv_patch.Prompt を必ず設定し、直前STEPの左から1番のプロンプトを更新してください:\n'
-                '{\n'
-                '  "ok": true,\n'
-                '  "message": {"type": "prompt_update", "before": "(要約)", "after": "(改善後プロンプト)"},\n'
-                '  "kv_patch": {"Prompt": {"-1": {"0": "(改善後プロンプト)"}}},\n'
-                '  "meta": {}\n'
+                '次のJSONで kv_patch.Prompt を必ず設定し、現在行の左から1番のプロンプト（Ingestor）を更新してください:\\n'
+                '{\\n'
+                '  "ok": true,\\n'
+                '  "message": {"type": "prompt_update", "before": "(要約)", "after": "(改善後プロンプト)"},\\n'
+                '  "kv_patch": {"Prompt": {"0": {"0": "(改善後プロンプト)"}}},\\n'
+                '  "meta": {}\\n'
                 '}'
             )
-
-    ag.user_prompt = st.text_area("指示プロンプト", key=k, height=240)
-    ag.user_prompt = st.session_state.get(k, "")
 
     ac1, ac2 = st.columns(2)
     with ac1:
@@ -1292,12 +1712,11 @@ def render_detail():
         ctx = build_context_for_row(r)
         raw_instr = st.session_state.get(k, "")
         expanded_instr = expand_prompt_macros(raw_instr, ctx, row_idx=r)
-
         system_view = SCHEMA_ENFORCER
         user_view_before = raw_instr
         user_view_after = expanded_instr
 
-        st.caption("System（システムプロンプト：利用者編集不可）")
+        st.caption("System（システムプロンプト：編集不可）")
         st.code(system_view)
         st.caption("User（指示プロンプト：展開前）")
         st.code(user_view_before or "(empty)")

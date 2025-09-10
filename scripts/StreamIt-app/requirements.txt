@@ -1,2 +1,16 @@
 streamlit>=1.36.0
 openai>=1.37.0
+# Additional dependencies used by StreamIt-app
+beautifulsoup4
+html2text
+lxml
+openpyxl
+pandas
+pypandoc
+readability-lxml
+requests
+streamlit-sortables
+trafilatura
+toml
+jsonschema
+python-docx
